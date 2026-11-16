@@ -8,6 +8,7 @@ import {
   Maximize2,
   PanelRight,
   Plus,
+  QrCode,
   Scissors,
   Search,
   SlidersHorizontal,
@@ -22,6 +23,8 @@ import {
   type VariantRecord,
 } from './bio/types';
 import { AllChromsOverviewCanvas } from './components/AllChromsOverviewCanvas';
+import { BarcodeScannerModal } from './components/BarcodeScannerModal';
+import { BlastModal } from './components/BlastModal';
 import { ChromosomeIdeogram } from './components/ChromosomeIdeogram';
 import { FileLoaderModal } from './components/FileLoaderModal';
 import { GenomeCanvasViewer, type InteractionMode } from './components/GenomeCanvasViewer';
@@ -31,6 +34,12 @@ import { matchDroppedFiles } from './utils/fileMatcher';
 import { WgsWorkerClient } from './workers/wgsClient';
 import type {
   AllChromsOverviewResult,
+  BarcodeProgressEvent,
+  BarcodeScanPayload,
+  BarcodeScanResult,
+  BlastProgressEvent,
+  BlastRunPayload,
+  BlastSearchResult,
   ExtractionResult,
   LoadLocalFilesPayload,
   ScanProgressEvent,
@@ -121,6 +130,19 @@ export default function App() {
   const [scannedVariants, setScannedVariants] = useState<VariantRecord[]>([]);
   const [isScanning, setIsScanning] = useState(false);
   const [scanProgress, setScanProgress] = useState<ScanProgressEvent | null>(null);
+
+  const [isBlastOpen, setIsBlastOpen] = useState(false);
+  const [isBlasting, setIsBlasting] = useState(false);
+  const [blastProgress, setBlastProgress] = useState<BlastProgressEvent | null>(null);
+  const [blastError, setBlastError] = useState<string | null>(null);
+  const [blastResult, setBlastResult] = useState<BlastSearchResult | null>(null);
+  const [blastInitialQuery, setBlastInitialQuery] = useState('');
+
+  const [isBarcodeOpen, setIsBarcodeOpen] = useState(false);
+  const [isScanningBarcodes, setIsScanningBarcodes] = useState(false);
+  const [barcodeProgress, setBarcodeProgress] = useState<BarcodeProgressEvent | null>(null);
+  const [barcodeError, setBarcodeError] = useState<string | null>(null);
+  const [barcodeResult, setBarcodeResult] = useState<BarcodeScanResult | null>(null);
 
   const currentChromLength = useMemo(() => {
     if (!workspace) return 576874;
@@ -302,6 +324,12 @@ export default function App() {
       (loadEv) => {
         setLoadingMessage(loadEv.message);
       },
+      (blastEv) => {
+        setBlastProgress(blastEv);
+      },
+      (barEv) => {
+        setBarcodeProgress(barEv);
+      },
     );
     workerRef.current = client;
 
@@ -381,6 +409,14 @@ export default function App() {
         setShowSearchDropdown(false);
         return;
       }
+      if (isBlastOpen) {
+        setIsBlastOpen(false);
+        return;
+      }
+      if (isBarcodeOpen) {
+        setIsBarcodeOpen(false);
+        return;
+      }
       if (isExtractorOpen) {
         setIsExtractorOpen(false);
         return;
@@ -399,7 +435,7 @@ export default function App() {
     };
     window.addEventListener('keydown', handleEsc);
     return () => window.removeEventListener('keydown', handleEsc);
-  }, [showSearchDropdown, isExtractorOpen, isLoaderOpen, activeSelection, interactionMode]);
+  }, [showSearchDropdown, isBlastOpen, isBarcodeOpen, isExtractorOpen, isLoaderOpen, activeSelection, interactionMode]);
 
   useEffect(() => {
     const onDocClick = (ev: MouseEvent) => {
@@ -850,6 +886,85 @@ export default function App() {
     setIsScanning(false);
   };
 
+  const handleRunBlast = async (payload: BlastRunPayload) => {
+    const client = workerRef.current;
+    if (!client) return;
+    setIsBlasting(true);
+    setBlastError(null);
+    setBlastProgress({ type: 'blast_progress', message: '로컬 BLAST 준비 중...', percent: 2 });
+    try {
+      const res = await client.runBlast({
+        ...payload,
+        contigOverrides,
+      });
+      setBlastResult(res);
+    } catch (err) {
+      setBlastError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setIsBlasting(false);
+    }
+  };
+
+  const handleCancelBlast = async () => {
+    await workerRef.current?.cancelBlast();
+    setIsBlasting(false);
+  };
+
+  const handleJumpToBlastHit = (hitChrom: string, hitStart: number, hitEnd: number) => {
+    const targetLen =
+      workspace?.contigs.find((c) => c.name === hitChrom)?.length ?? currentChromLength;
+    const span = Math.max(1, hitEnd - hitStart);
+    const pad = Math.max(80, Math.round(span * 0.4));
+    const viewS = Math.max(0, hitStart - pad);
+    const viewE = Math.min(targetLen, hitEnd + pad);
+    if (hitChrom !== chrom) setScannedVariants([]);
+    setHighlightedGene(null);
+    setActiveSelection({ start: hitStart, end: hitEnd });
+    setIsBlastOpen(false);
+    void fetchWindow(hitChrom, viewS, viewE);
+  };
+
+  const handleStartBarcodeScan = async (payload: BarcodeScanPayload) => {
+    const client = workerRef.current;
+    if (!client) return;
+    setIsScanningBarcodes(true);
+    setBarcodeError(null);
+    setBarcodeProgress({
+      type: 'barcode_progress',
+      message: '바코드 · 삽입 스카 탐색 준비 중...',
+      percent: 2,
+      foundSoFar: 0,
+    });
+    try {
+      const res = await client.scanBarcodes({
+        ...payload,
+        contigOverrides,
+      });
+      setBarcodeResult(res);
+    } catch (err) {
+      setBarcodeError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setIsScanningBarcodes(false);
+    }
+  };
+
+  const handleCancelBarcodeScan = async () => {
+    await workerRef.current?.cancelBarcodeScan();
+    setIsScanningBarcodes(false);
+  };
+
+  const handleJumpToBarcodeBreakpoint = (bpChrom: string, anchorPos: number) => {
+    const targetLen =
+      workspace?.contigs.find((c) => c.name === bpChrom)?.length ?? currentChromLength;
+    const viewS = Math.max(0, anchorPos - 150);
+    const viewE = Math.min(targetLen, anchorPos + 150);
+    if (bpChrom !== chrom) setScannedVariants([]);
+    setHighlightedGene(null);
+    setActiveSelection({ start: Math.max(0, anchorPos - 10), end: Math.min(targetLen, anchorPos + 10) });
+    setIsBarcodeOpen(false);
+    void fetchWindow(bpChrom, viewS, viewE);
+  };
+
   const hasStrain2 =
     secondaryIdx !== null &&
     workspace !== null &&
@@ -1059,6 +1174,26 @@ export default function App() {
             }`}
           >
             전체 염기
+          </button>
+
+          <button
+            type="button"
+            onClick={() => setIsBlastOpen(true)}
+            className="inline-flex items-center gap-1 rounded border border-indigo-600 bg-indigo-600 px-2.5 py-1 font-semibold text-white hover:bg-indigo-700"
+            title="입력한 DNA/프라이머 서열을 Reference와 로드된 BAM 균주에 동시 BLAST 매핑"
+          >
+            <Dna className="h-3.5 w-3.5" />
+            로컬 BLAST
+          </button>
+
+          <button
+            type="button"
+            onClick={() => setIsBarcodeOpen(true)}
+            className="inline-flex items-center gap-1 rounded border border-amber-600 bg-amber-600 px-2.5 py-1 font-semibold text-white hover:bg-amber-700"
+            title="외부 삽입 바코드(UPTAG/DNTAG·loxP·FRT) 및 미지 워터마크 스카 자동 스캔"
+          >
+            <QrCode className="h-3.5 w-3.5" />
+            바코드 스캔
           </button>
 
           <button
@@ -1390,6 +1525,11 @@ export default function App() {
         options={options}
         onClose={() => setIsExtractorOpen(false)}
         onClearAndClose={handleCancelSelection}
+        onSendToLocalBlast={(qFasta) => {
+          setIsExtractorOpen(false);
+          setBlastInitialQuery(qFasta);
+          setIsBlastOpen(true);
+        }}
         onRecompute={(c, s, e, nextOpts) => {
           setOptions(nextOpts);
           const keepFeat =
@@ -1400,6 +1540,42 @@ export default function App() {
               ? extractFeature
               : null;
           void runExtract(c, s, e, nextOpts, keepFeat);
+        }}
+      />
+
+      <BlastModal
+        isOpen={isBlastOpen}
+        isRunning={isBlasting}
+        progress={blastProgress}
+        errorMsg={blastError}
+        result={blastResult}
+        initialQuery={blastInitialQuery}
+        referenceLabel={workspace?.referenceLabel ?? 'sacCer3'}
+        strainLabels={workspace?.strains.map((s) => s.label) ?? []}
+        currentChrom={chrom}
+        options={options}
+        onClose={() => setIsBlastOpen(false)}
+        onRunBlast={(p) => void handleRunBlast(p)}
+        onCancelBlast={() => void handleCancelBlast()}
+        onJumpToHit={handleJumpToBlastHit}
+      />
+
+      <BarcodeScannerModal
+        isOpen={isBarcodeOpen}
+        isScanning={isScanningBarcodes}
+        progress={barcodeProgress}
+        errorMsg={barcodeError}
+        result={barcodeResult}
+        strainLabels={workspace?.strains.map((s) => s.label) ?? []}
+        currentChrom={chrom}
+        onClose={() => setIsBarcodeOpen(false)}
+        onStartScan={(p) => void handleStartBarcodeScan(p)}
+        onCancelScan={() => void handleCancelBarcodeScan()}
+        onJumpToBreakpoint={handleJumpToBarcodeBreakpoint}
+        onSendToBlast={(qFasta) => {
+          setIsBarcodeOpen(false);
+          setBlastInitialQuery(qFasta);
+          setIsBlastOpen(true);
         }}
       />
     </div>

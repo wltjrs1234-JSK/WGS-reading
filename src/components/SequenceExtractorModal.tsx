@@ -40,6 +40,7 @@ interface SequenceExtractorModalProps {
   options: ConsensusOptions;
   onClose: () => void;
   onClearAndClose: () => void;
+  onSendToLocalBlast?: (queryFasta: string) => void;
   onRecompute: (
     chrom: string,
     start: number,
@@ -417,6 +418,7 @@ export const SequenceExtractorModal: React.FC<SequenceExtractorModalProps> = ({
   options,
   onClose,
   onClearAndClose,
+  onSendToLocalBlast,
   onRecompute,
 }) => {
   const [seqFormatMode, setSeqFormatMode] = useState<'ungapped' | 'aligned'>('ungapped');
@@ -1531,20 +1533,42 @@ export const SequenceExtractorModal: React.FC<SequenceExtractorModalProps> = ({
               </button>
             </div>
 
-            {extractedModel.strains.length > 0 && (
-              <a
-                href={`https://blast.ncbi.nlm.nih.gov/Blast.cgi?PROGRAM=blastn&PAGE_TYPE=BlastSearch&QUERY=${encodeURIComponent(
-                  extractedModel.strains[0].cardSeq.replace(/-/g, '').slice(0, 7000),
-                )}`}
-                target="_blank"
-                rel="noreferrer"
-                className="inline-flex items-center gap-1.5 rounded-xl border border-emerald-300 bg-emerald-50 px-3.5 py-2 text-xs font-semibold text-emerald-800 hover:bg-emerald-100"
-                title="GET URL 길이 제한으로 최대 7,000 bp까지만 자동 입력됩니다"
-              >
-                <ExternalLink className="h-3.5 w-3.5" />
-                균주1 서열 NCBI BLAST
-              </a>
-            )}
+            <div className="flex flex-wrap items-center gap-2">
+              {onSendToLocalBlast && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    const targetSeq =
+                      extractedModel.strains.length > 0
+                        ? extractedModel.strains[0].cardSeq.replace(/-/g, '')
+                        : extractedModel.refCardSeq.replace(/-/g, '');
+                    const label =
+                      extractedModel.strains.length > 0
+                        ? `${extractedModel.strains[0].title}_${extractedModel.coordTag}`
+                        : `Ref_${extractedModel.coordTag}`;
+                    onSendToLocalBlast(`>${label}\n${targetSeq}`);
+                  }}
+                  className="inline-flex items-center gap-1.5 rounded-xl border border-indigo-300 bg-indigo-50 px-3.5 py-2 text-xs font-semibold text-indigo-800 hover:bg-indigo-100"
+                >
+                  로컬 BLAST로 매핑 확인
+                </button>
+              )}
+
+              {extractedModel.strains.length > 0 && (
+                <a
+                  href={`https://blast.ncbi.nlm.nih.gov/Blast.cgi?PROGRAM=blastn&PAGE_TYPE=BlastSearch&QUERY=${encodeURIComponent(
+                    extractedModel.strains[0].cardSeq.replace(/-/g, '').slice(0, 7000),
+                  )}`}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="inline-flex items-center gap-1.5 rounded-xl border border-emerald-300 bg-emerald-50 px-3.5 py-2 text-xs font-semibold text-emerald-800 hover:bg-emerald-100"
+                  title="GET URL 길이 제한으로 최대 7,000 bp까지만 자동 입력됩니다"
+                >
+                  <ExternalLink className="h-3.5 w-3.5" />
+                  균주1 서열 NCBI BLAST
+                </a>
+              )}
+            </div>
           </div>
         )}
       </div>

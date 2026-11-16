@@ -1,5 +1,15 @@
 import { describe, expect, it } from 'vitest';
 import {
+  annotateCrossStrainSpecificity,
+  buildBarcodeCandidatesForRegion,
+  collectBarcodeSignalsFromReads,
+  hasDominantTandemRepeat,
+  isLikelyArtifactSequence,
+  isRepetitiveYeastRegion,
+  trimReferenceFlanksFromClip,
+  type BarcodeBuildTelemetry,
+} from '../barcodeScanner';
+import {
   buildAnalysisFromCalls,
   buildThreeWayAnalysis,
   computeConsensusForRegion,
@@ -15,6 +25,13 @@ import {
   translateDna,
 } from '../geneticCode';
 import { AnnotationIndex, parseGff3Text } from '../gff3Parser';
+import {
+  buildBlastReferenceIndex,
+  evaluateHitAgainstStrainCalls,
+  findForeignMatchesInReads,
+  parseBlastQueries,
+  searchBlastReference,
+} from '../localBlast';
 import { parseCigar } from '../cigar';
 import { packGeneFeatures } from '../geneLayout';
 import { deriveAlleleTicksFromCalls, packReadsWithHeap } from '../readPacking';
@@ -744,5 +761,455 @@ chrV\tSGD\tmRNA\t437191\t437532\t.\t+\t.\tID=YER133W-A_mRNA;Parent=YER133W-A
     const batch1 = matchDroppedFiles([new File([''], 's.bam'), new File([''], 's.bam.bai')]);
     const batch2 = matchDroppedFiles([new File([''], 's.bam'), new File([''], 's.bam.bai')]);
     expect(batch1.pairedStrains[0].id).not.toBe(batch2.pairedStrains[0].id);
+  });
+});
+
+describe('localBlast (Reference Seed-Extend, Short Primer Mismatch, BAM Strain Comparison, Foreign Soft-clip)', () => {
+  const mkDummyGenome = () => {
+    // Construct deterministic non-repetitive yeast-like contigs (unique 4-mer tiling)
+    const bases = ['A', 'C', 'G', 'T'];
+    const gen = (seed: number, len: number) => {
+      let s = seed;
+      const out: string[] = [];
+      for (let i = 0; i < len; i++) {
+        s = (s * 1664525 + 1013904223) >>> 0;
+        out.push(bases[(s >>> 28) & 3]);
+      }
+      return out.join('');
+    };
+    return [
+      { name: 'chrI', seq: gen(12345, 800) },
+      { name: 'chrVI', seq: gen(67890, 900) },
+    ];
+  };
+
+  it('parses FASTA/RNA inputs cleanly and locates exact forward, reverse-complement, and indel hits', () => {
+    const queries = parseBlastQueries('>q1\naugc cga 123 tta ggg\n>q2\nAAACCCGGGTTTAAA');
+    expect(queries).toHaveLength(2);
+    expect(queries[0]).toEqual({ id: 'q1', seq: 'ATGCCGATTAGGG' });
+
+    const contigs = mkDummyGenome();
+    const index = buildBlastReferenceIndex(contigs);
+
+    // 1. Exact forward hit on chrVI:250..310 + 1 SNP on query
+    const exactRegion = contigs[1].seq.slice(250, 310);
+    const snpPos = 30;
+    const altBase = exactRegion[snpPos] === 'A' ? 'G' : 'A';
+    const mutQuerySeq = exactRegion.slice(0, snpPos) + altBase + exactRegion.slice(snpPos + 1);
+
+    const mutHits = searchBlastReference(index, { id: 'mutProbe', seq: mutQuerySeq }, { minIdentityPct: 80 });
+    expect(mutHits.length).toBeGreaterThanOrEqual(1);
+    expect(mutHits[0]).toMatchObject({
+      chrom: 'chrVI',
+      refStart: 250,
+      refEnd: 310,
+      strand: '+',
+      mismatches: 1,
+      identities: 59,
+    });
+
+    // 2. Minus-strand reverse-complement hit on chrI:400..450
+    const rcQuery = reverseComplement(contigs[0].seq.slice(400, 450));
+    const rcHits = searchBlastReference(index, { id: 'rcProbe', seq: rcQuery });
+    expect(rcHits.length).toBeGreaterThanOrEqual(1);
+    expect(rcHits[0]).toMatchObject({
+      chrom: 'chrI',
+      refStart: 400,
+      refEnd: 450,
+      strand: '-',
+      identityPct: 100,
+    });
+  });
+
+  it('finds 20 bp short primers carrying 2 mismatches via pigeonhole scan', () => {
+    const contigs = mkDummyGenome();
+    const index = buildBlastReferenceIndex(contigs);
+    const target20 = contigs[0].seq.slice(180, 200);
+    const flip = (b: string) => (b === 'A' ? 'T' : 'A');
+    // Flip pos 3 and pos 13 -> breaks any 11-mer seed, max contiguous exact match <= 9 bp
+    const primer2Mis =
+      target20.slice(0, 3) +
+      flip(target20[3]) +
+      target20.slice(4, 13) +
+      flip(target20[13]) +
+      target20.slice(14);
+
+    const hits = searchBlastReference(
+      index,
+      { id: 'primer20', seq: primer2Mis },
+      { minIdentityPct: 85, shortPrimerMaxMismatches: 2 },
+    );
+    expect(hits.length).toBeGreaterThanOrEqual(1);
+    expect(hits[0]).toMatchObject({
+      chrom: 'chrI',
+      refStart: 180,
+      refEnd: 200,
+      strand: '+',
+      mismatches: 2,
+      identities: 18,
+    });
+  });
+
+  it('evaluates BLAST hits simultaneously against WT, Mutant SNP, and Deleted BAM strains', () => {
+    const contigs = mkDummyGenome();
+    const index = buildBlastReferenceIndex(contigs);
+    const refSegment = contigs[1].seq.slice(300, 340);
+    const mutAlt = refSegment[15] === 'C' ? 'T' : 'C';
+    const mutantProbe = refSegment.slice(0, 15) + mutAlt + refSegment.slice(16);
+
+    const hits = searchBlastReference(index, { id: 'mutantSeq', seq: mutantProbe });
+    const topHit = hits[0];
+    expect(topHit.mismatches).toBe(1); // 97.5% vs Ref
+
+    const wtReads: AlignedRead[] = Array.from({ length: 8 }, (_, i) => ({
+      id: `wt_${i}`,
+      name: `wt_${i}`,
+      start: 295,
+      end: 345,
+      strand: '+',
+      seq: contigs[1].seq.slice(295, 345),
+      cigar: '50M',
+      mapq: 60,
+      flags: 0,
+    }));
+    const mutFullSeq = contigs[1].seq.slice(295, 315) + mutAlt + contigs[1].seq.slice(316, 345);
+    const mutReads: AlignedRead[] = Array.from({ length: 8 }, (_, i) => ({
+      id: `mut_${i}`,
+      name: `mut_${i}`,
+      start: 295,
+      end: 345,
+      strand: '+',
+      seq: mutFullSeq,
+      cigar: '50M',
+      mapq: 60,
+      flags: 0,
+    }));
+
+    const wtCalls = computeConsensusForRegion(refSegment, wtReads, 300, 340, DEFAULT_CONSENSUS_OPTIONS);
+    const mutCalls = computeConsensusForRegion(refSegment, mutReads, 300, 340, DEFAULT_CONSENSUS_OPTIONS);
+
+    const cmpWt = evaluateHitAgainstStrainCalls(topHit, 'wt', 'WT', 'chrVI', wtCalls, wtReads);
+    const cmpMut = evaluateHitAgainstStrainCalls(topHit, 'mut', 'Mutant', 'chrVI', mutCalls, mutReads);
+    const cmpKo = evaluateHitAgainstStrainCalls(topHit, 'ko', 'KO_Strain', 'chrVI', [], []);
+
+    expect(cmpWt.identityVsQueryPct).toBe(97.5);
+    expect(cmpWt.snpCountVsRef).toBe(0);
+    expect(cmpMut.identityVsQueryPct).toBe(100);
+    expect(cmpMut.snpCountVsRef).toBe(1);
+    expect(cmpMut.meanDepth).toBe(8);
+    expect(cmpKo.coveragePct).toBe(0);
+  });
+
+  it('detects foreign insertion sequences anchored in BAM soft-clip reads', () => {
+    const foreignCassette = 'GCTAGCATGCATGCTAGCATTACCGTTA'; // 28 bp foreign cassette absent from Reference
+    const clipReads: AlignedRead[] = Array.from({ length: 5 }, (_, i) => ({
+      id: `split_${i}`,
+      name: `split_${i}`,
+      start: 1000,
+      end: 1020,
+      strand: '+',
+      seq: 'AAAAAAAAAAAAAAAAAAAA' + foreignCassette.slice(0, 24),
+      cigar: '20M24S',
+      mapq: 60,
+      flags: 0,
+    }));
+
+    const fHits = findForeignMatchesInReads(
+      { id: 'KanMX_junction', seq: foreignCassette },
+      's1',
+      'Mutant_Insert',
+      'chrV',
+      clipReads,
+    );
+    expect(fHits).toHaveLength(1);
+    expect(fHits[0]).toMatchObject({
+      strainLabel: 'Mutant_Insert',
+      chrom: 'chrV',
+      anchorPos: 1019,
+      clipSide: 'right_clip',
+      supportingReads: 5,
+      identityPct: 100,
+    });
+  });
+});
+
+describe('barcodeScanner (Standard YKO/Cre Barcodes & De Novo Blind Watermarks)', () => {
+  it('detects YKO UPTAG barcodes flanked by U1/U2 and extracts the exact 20-mer tag', () => {
+    const u1 = 'GATGTCCACGAGGTCTCT';
+    const tag20 = 'ATGCTTAGCCGTACGATCTA';
+    const u2 = 'CGTACGCTGCAGGTCGAC';
+    const insertedCassette = u1 + tag20 + u2; // 56 bp insertion inside read
+
+    const reads: AlignedRead[] = Array.from({ length: 8 }, (_, i) => ({
+      id: `u_${i}`,
+      name: `u_${i}`,
+      start: 500,
+      end: 540,
+      strand: '+',
+      seq: 'TTTTTTTTTT' + insertedCassette + 'GGGGGGGGGGGGGGGGGGGGGGGGGGGGGG',
+      cigar: `10M${insertedCassette.length}I30M`,
+      mapq: 60,
+      flags: 0,
+    }));
+
+    const signals = collectBarcodeSignalsFromReads('chrV', reads, 400, 700);
+    const cands = buildBarcodeCandidatesForRegion('mut', 'Mutant', signals, reads, []);
+    expect(cands).toHaveLength(1);
+    expect(cands[0].classification).toBe('known_barcode_or_scar');
+    expect(cands[0].extractedBarseq20mer).toBe(tag20);
+    expect(cands[0].motifHits.map((m) => m.motifId)).toEqual(
+      expect.arrayContaining(['yko_u1', 'yko_u2_mx4']),
+    );
+  });
+
+  it('assembles unknown vendor proprietary barcodes de novo from opposing soft-clips and marks strain specificity', () => {
+    // 32 bp unknown vendor DNA watermark integrated between pos 1000 and 1001
+    const vendorTag = 'GACTAGTCGGATCCTTACCAGTTGACATGCTA';
+    const rightClips: AlignedRead[] = Array.from({ length: 6 }, (_, i) => ({
+      id: `rc_${i}`,
+      name: `rc_${i}`,
+      start: 960,
+      end: 1000,
+      strand: '+',
+      seq: 'A'.repeat(40) + vendorTag.slice(0, 22), // extends 22 bp right from junction
+      cigar: '40M22S',
+      mapq: 60,
+      flags: 0,
+    }));
+    const leftClips: AlignedRead[] = Array.from({ length: 6 }, (_, i) => ({
+      id: `lc_${i}`,
+      name: `lc_${i}`,
+      start: 1000,
+      end: 1040,
+      strand: '+',
+      seq: vendorTag.slice(10) + 'C'.repeat(40), // overlaps middle 12 bp and reaches junction 1000
+      cigar: '22S40M',
+      mapq: 60,
+      flags: 0,
+    }));
+
+    // Common background site shared by both WT and Target
+    const sharedInsert = 'GTACTGACTGAGCATGCTA';
+    const sharedReads: AlignedRead[] = Array.from({ length: 6 }, (_, i) => ({
+      id: `sh_${i}`,
+      name: `sh_${i}`,
+      start: 2000,
+      end: 2040,
+      strand: '+',
+      seq: 'A'.repeat(15) + sharedInsert + 'C'.repeat(25),
+      cigar: `15M${sharedInsert.length}I25M`,
+      mapq: 60,
+      flags: 0,
+    }));
+
+    const mutReads = [...rightClips, ...leftClips, ...sharedReads];
+    const wtReads = [...sharedReads];
+
+    const mutCands = buildBarcodeCandidatesForRegion(
+      'mut',
+      'Vendor_Strain',
+      collectBarcodeSignalsFromReads('chrIV', mutReads, 900, 2100),
+      mutReads,
+      [],
+    );
+    const wtCands = buildBarcodeCandidatesForRegion(
+      'wt',
+      'WT_Control',
+      collectBarcodeSignalsFromReads('chrIV', wtReads, 900, 2100),
+      wtReads,
+      [],
+    );
+
+    const compared = annotateCrossStrainSpecificity([...mutCands, ...wtCands], 2);
+    const topUnique = compared.find((c) => c.specificity === 'strain_specific');
+    expect(topUnique).toBeDefined();
+    expect(topUnique!.signalType).toBe('paired_insertion');
+    expect(topUnique!.classification).toBe('novel_insertion_barcode');
+    expect(topUnique!.assembledSeq).toBe(vendorTag);
+
+    const sharedCount = compared.filter((c) => c.specificity === 'shared').length;
+    expect(sharedCount).toBe(2);
+  });
+
+  it('rejects Illumina adapters, VNTR tandem repeats, and low-complexity noise', () => {
+    expect(isLikelyArtifactSequence('AGATCGGAAGAGCACACGTCTGAACTCCAG')).toBe(true);
+    expect(isLikelyArtifactSequence('CTGTCTCTTATACACATCTCCGAGCCC')).toBe(true);
+    expect(isLikelyArtifactSequence('AAAAAAAAAAAAAAAAAAAA')).toBe(true);
+    expect(isLikelyArtifactSequence('ATATATATATATATATATATAT')).toBe(true);
+    // Real chrXII rDNA NTS VNTR motifs observed in yeast WGS
+    const nts1Vntr =
+      'CAATATCCTCCTCCGATATTCTCCTCCGATATTCTCCTCCGATATTCTCCTCCGATATTCTCCTCCGATATTCCTACAAAAAAA';
+    const nts2Vntr = 'GCGGAAGCGGAAGCGGAAGCGGAAGCGGA';
+    expect(hasDominantTandemRepeat(nts1Vntr)).toBe(true);
+    expect(hasDominantTandemRepeat(nts2Vntr)).toBe(true);
+    expect(isLikelyArtifactSequence(nts1Vntr)).toBe(true);
+    expect(isLikelyArtifactSequence(nts2Vntr)).toBe(true);
+    expect(hasDominantTandemRepeat('GACTAGTCGGATCCTTACCAGTTGACATGCTA')).toBe(false);
+    expect(isLikelyArtifactSequence('GACTAGTCGGATCCTTACCAGTTGAC')).toBe(false);
+  });
+
+  it('trims Reference flanks from soft-clips, deduplicates insertion+clip clusters, and excludes repetitive loci / MAPQ=0 reads while retaining known motifs', () => {
+    const refWindow =
+      'GGGTAACCCAGTCCTCGCTATTTTTTACTGTGACGTCGATCAGTCATGGTCTCGATACGGAAACGCGCGGGATCCGTTAGCCT';
+    const refStart = 1000;
+    const anchor = 1029; // right after GGGTAACCCAGTCCTCGCTATTTTTTACT (29 bp)
+
+    // Soft-clip carrying 29 bp upstream Ref + 24 bp foreign tag -> trimming keeps pure 24 bp foreign tag
+    const foreign24 = 'ACTGGTCAACCTGATTCGATGCAT';
+    const upstream29 = refWindow.slice(0, 29);
+    expect(trimReferenceFlanksFromClip(upstream29 + foreign24, 'left_clip', anchor, refStart, refWindow)).toBe(
+      foreign24,
+    );
+
+    // Soft-clip carrying pure downstream Ref -> trimmed completely
+    const downstream25 = refWindow.slice(29, 54);
+    expect(trimReferenceFlanksFromClip(downstream25, 'right_clip', anchor, refStart, refWindow)).toBe('');
+
+    // Deduplicate Insertion + adjacent Soft-clip at the exact same locus (no duplicate entries)
+    const novelInsert = 'TTACCGTAGGCAATGCCGATCA'; // 22 bp non-repeat
+    const insAndClipReads: AlignedRead[] = [
+      ...Array.from({ length: 6 }, (_, i) => ({
+        id: `ins_${i}`,
+        name: `ins_${i}`,
+        start: 1010,
+        end: 1060,
+        strand: '+' as const,
+        seq: 'A'.repeat(19) + novelInsert + 'G'.repeat(31),
+        cigar: `19M${novelInsert.length}I31M`,
+        mapq: 60,
+        flags: 0,
+      })),
+      ...Array.from({ length: 6 }, (_, i) => ({
+        id: `clip_${i}`,
+        name: `clip_${i}`,
+        start: 1005,
+        end: 1030,
+        strand: '+' as const,
+        seq: 'T'.repeat(25) + novelInsert.slice(0, 14),
+        cigar: '25M14S',
+        mapq: 60,
+        flags: 0,
+      })),
+    ];
+    const dedupSignals = collectBarcodeSignalsFromReads('chrIV', insAndClipReads, 990, 1080);
+    const dedupCands = buildBarcodeCandidatesForRegion('st', 'Strain', dedupSignals, insAndClipReads, []);
+    expect(dedupCands).toHaveLength(1);
+    expect(dedupCands[0].signalType).toBe('insertion');
+    expect(dedupCands[0].assembledSeq).toBe(novelInsert);
+
+    // MAPQ=0 multi-mappers rejected by default minMapQ=10
+    const lowMapqReads: AlignedRead[] = Array.from({ length: 8 }, (_, i) => ({
+      id: `lm_${i}`,
+      name: `lm_${i}`,
+      start: 2000,
+      end: 2040,
+      strand: '+' as const,
+      seq: 'A'.repeat(10) + novelInsert + 'C'.repeat(30),
+      cigar: `10M${novelInsert.length}I30M`,
+      mapq: 0,
+      flags: 0,
+    }));
+    expect(collectBarcodeSignalsFromReads('chrIV', lowMapqReads, 1980, 2060)).toHaveLength(0);
+
+    // Repetitive chrXII rDNA locus filters unannotated novel/VNTR signals, but preserves known loxP scar
+    expect(isRepetitiveYeastRegion('chrXII', 458_669, [])).toBe(true);
+    expect(isRepetitiveYeastRegion('chrV', 116_000, [])).toBe(false);
+
+    const rdnaReads: AlignedRead[] = [
+      ...Array.from({ length: 8 }, (_, i) => ({
+        id: `vntr_${i}`,
+        name: `vntr_${i}`,
+        start: 458_650,
+        end: 458_700,
+        strand: '+' as const,
+        seq: 'A'.repeat(18) + novelInsert + 'C'.repeat(32),
+        cigar: `18M${novelInsert.length}I32M`,
+        mapq: 60,
+        flags: 0,
+      })),
+      ...Array.from({ length: 8 }, (_, i) => ({
+        id: `lox_${i}`,
+        name: `lox_${i}`,
+        start: 458_850,
+        end: 458_900,
+        strand: '+' as const,
+        seq: 'A'.repeat(15) + 'ATAACTTCGTATAGCATACATTATACGAAGTTAT' + 'C'.repeat(35),
+        cigar: '15M34I35M',
+        mapq: 60,
+        flags: 0,
+      })),
+    ];
+    const telemetry: BarcodeBuildTelemetry = {
+      repeatLociFiltered: 0,
+      tandemOrArtifactFiltered: 0,
+    };
+    const rdnaSignals = collectBarcodeSignalsFromReads('chrXII', rdnaReads, 458_500, 459_100);
+    const rdnaCands = buildBarcodeCandidatesForRegion(
+      'st',
+      'Strain',
+      rdnaSignals,
+      rdnaReads,
+      [],
+      { excludeRepeatLoci: true },
+      undefined,
+      telemetry,
+    );
+    expect(telemetry.repeatLociFiltered).toBe(1);
+    expect(rdnaCands).toHaveLength(1);
+    expect(rdnaCands[0].classification).toBe('known_barcode_or_scar');
+  });
+
+  it('detects all 10 user-designed 20-mer barcodes cleanly and rescues paired partial clips at minClipLen=20', () => {
+    const tenBarcodes = [
+      'GTTGCTGTTCCGTTATAGAC',
+      'GAGGATCACTGCACTCATAA',
+      'GAGACAGTACAACTTGCTTG',
+      'CGCAGAATAACCTTGCTCTC',
+      'GCCGAAGACCTAGAACCATA',
+      'AGCGTAGTGTACTCAGGTAG',
+      'ATCATTCGACAACGCGAGAG',
+      'AGCATATAATCAGGCGTCTG',
+      'CAGTATCGGATTGGAACATG',
+      'AGAACTCCATTCCTGAAGTG',
+    ];
+
+    for (const seq of tenBarcodes) {
+      expect(hasDominantTandemRepeat(seq)).toBe(false);
+      expect(isLikelyArtifactSequence(seq)).toBe(false);
+    }
+
+    // Even under strict minClipLen=20, opposing 15bp right_clip + 15bp left_clip overlapping by 10bp
+    // must be rescued and merged into exact 20bp barcode CAGTATCGGATTGGAACATG
+    const bc9 = tenBarcodes[8];
+    const paired15Reads: AlignedRead[] = [
+      ...Array.from({ length: 6 }, (_, i) => ({
+        id: `pr_${i}`,
+        name: `pr_${i}`,
+        start: 1000,
+        end: 1050,
+        strand: '+' as const,
+        seq: 'A'.repeat(50) + bc9.slice(0, 15),
+        cigar: '50M15S',
+        mapq: 60,
+        flags: 0,
+      })),
+      ...Array.from({ length: 6 }, (_, i) => ({
+        id: `pl_${i}`,
+        name: `pl_${i}`,
+        start: 1050,
+        end: 1100,
+        strand: '+' as const,
+        seq: bc9.slice(5) + 'C'.repeat(50),
+        cigar: '15S50M',
+        mapq: 60,
+        flags: 0,
+      })),
+    ];
+    const strictOpts = { minClipLen: 20, minInsertLen: 18 };
+    const signals = collectBarcodeSignalsFromReads('chrIX', paired15Reads, 950, 1150, strictOpts);
+    const cands = buildBarcodeCandidatesForRegion('st', 'Strain', signals, paired15Reads, [], strictOpts);
+    expect(cands).toHaveLength(1);
+    expect(cands[0].signalType).toBe('paired_insertion');
+    expect(cands[0].assembledSeq).toBe(bc9);
   });
 });

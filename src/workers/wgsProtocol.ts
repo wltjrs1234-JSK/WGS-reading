@@ -1,4 +1,10 @@
+import type { BarcodeCandidate, BarcodeScanOptions } from '../bio/barcodeScanner';
 import type { RegionMappingStats } from '../bio/consensus';
+import type {
+  BlastForeignReadHit,
+  BlastRawHit,
+  BlastStrainComparison,
+} from '../bio/localBlast';
 import type { AlleleTick, PackedRead } from '../bio/readPacking';
 import type {
   AlignedRead,
@@ -125,6 +131,88 @@ export interface LoadProgressEvent {
   message: string;
 }
 
+export interface BlastProgressEvent {
+  type: 'blast_progress';
+  message: string;
+  percent: number;
+}
+
+export interface BlastRunPayload {
+  rawInput: string;
+  maxHitsPerQuery?: number;
+  minIdentityPct?: number;
+  shortPrimerMaxMismatches?: number;
+  foreignBamScope?: 'off' | 'current_chrom' | 'all_chroms';
+  currentChrom?: string;
+  options: ConsensusOptions;
+  contigOverrides?: Record<string, Record<string, string>>;
+}
+
+export interface BlastOverlappingGene {
+  id: string;
+  name: string;
+  systematicName?: string;
+  strand: '+' | '-' | '.';
+  start: number;
+  end: number;
+  relation: 'exact_or_contains' | 'inside_gene' | 'partial_overlap';
+}
+
+export interface BlastHitWithStrains extends BlastRawHit {
+  alignedQueryDisplay: string;
+  alignedRefDisplay: string;
+  overlappingGenes: BlastOverlappingGene[];
+  strains: BlastStrainComparison[];
+}
+
+export interface BlastQueryResult {
+  queryId: string;
+  queryLength: number;
+  hits: BlastHitWithStrains[];
+  foreignHits: BlastForeignReadHit[];
+}
+
+export interface BlastSearchResult {
+  referenceLabel: string;
+  totalRefLength: number;
+  elapsedMs: number;
+  queries: BlastQueryResult[];
+  strainLabels: string[];
+}
+
+export type BarcodeScanScope = 'hotspots' | 'current_chrom' | 'all_chroms';
+
+export interface BarcodeScanPayload {
+  scope: BarcodeScanScope;
+  currentChrom?: string;
+  targetStrainIndex?: number | null; // null = scan all loaded strains and compare
+  options?: BarcodeScanOptions;
+  contigOverrides?: Record<string, Record<string, string>>;
+}
+
+export interface BarcodeProgressEvent {
+  type: 'barcode_progress';
+  message: string;
+  percent: number;
+  foundSoFar: number;
+}
+
+export interface BarcodeScanFilteredStats {
+  repeatLociFiltered: number;
+  tandemOrArtifactFiltered: number;
+  endogenousRefFiltered: number;
+}
+
+export interface BarcodeScanResult {
+  scope: BarcodeScanScope;
+  scannedLociCount: number;
+  scannedBpTotal: number;
+  elapsedMs: number;
+  strainLabels: string[];
+  candidates: BarcodeCandidate[];
+  filteredStats?: BarcodeScanFilteredStats;
+}
+
 export type WorkerRequest =
   | { reqId: number; action: 'load_saccer3'; payload?: { sacCer3Url: string } }
   | { reqId: number; action: 'load_demo' }
@@ -165,10 +253,16 @@ export type WorkerRequest =
       };
     }
   | { reqId: number; action: 'cancel_scan' }
-  | { reqId: number; action: 'search_genes'; payload: { query: string; limit?: number } };
+  | { reqId: number; action: 'search_genes'; payload: { query: string; limit?: number } }
+  | { reqId: number; action: 'run_blast'; payload: BlastRunPayload }
+  | { reqId: number; action: 'cancel_blast' }
+  | { reqId: number; action: 'scan_barcodes'; payload: BarcodeScanPayload }
+  | { reqId: number; action: 'cancel_barcode_scan' };
 
 export type WorkerResponse =
   | { reqId: number; ok: true; data: unknown }
   | { reqId: number; ok: false; error: string }
   | ScanProgressEvent
-  | LoadProgressEvent;
+  | LoadProgressEvent
+  | BlastProgressEvent
+  | BarcodeProgressEvent;

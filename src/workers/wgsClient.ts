@@ -1,6 +1,12 @@
 import type { ConsensusOptions, GffFeature, VariantRecord } from '../bio/types';
 import type {
   AllChromsOverviewResult,
+  BarcodeProgressEvent,
+  BarcodeScanPayload,
+  BarcodeScanResult,
+  BlastProgressEvent,
+  BlastRunPayload,
+  BlastSearchResult,
   ExtractionPayload,
   ExtractionResult,
   LoadLocalFilesPayload,
@@ -23,13 +29,19 @@ export class WgsWorkerClient {
   private pending = new Map<number, PendingCall>();
   private onScanProgress?: (ev: ScanProgressEvent) => void;
   private onLoadProgress?: (ev: LoadProgressEvent) => void;
+  private onBlastProgress?: (ev: BlastProgressEvent) => void;
+  private onBarcodeProgress?: (ev: BarcodeProgressEvent) => void;
 
   constructor(
     onScanProgress?: (ev: ScanProgressEvent) => void,
     onLoadProgress?: (ev: LoadProgressEvent) => void,
+    onBlastProgress?: (ev: BlastProgressEvent) => void,
+    onBarcodeProgress?: (ev: BarcodeProgressEvent) => void,
   ) {
     this.onScanProgress = onScanProgress;
     this.onLoadProgress = onLoadProgress;
+    this.onBlastProgress = onBlastProgress;
+    this.onBarcodeProgress = onBarcodeProgress;
     this.worker = new Worker(new URL('./wgsWorker.ts', import.meta.url), {
       type: 'module',
     });
@@ -45,8 +57,19 @@ export class WgsWorkerClient {
           this.onLoadProgress?.(data);
           return;
         }
+        if (data.type === 'blast_progress') {
+          this.onBlastProgress?.(data);
+          return;
+        }
+        if (data.type === 'barcode_progress') {
+          this.onBarcodeProgress?.(data);
+          return;
+        }
       }
-      const res = data as Exclude<WorkerResponse, ScanProgressEvent | LoadProgressEvent>;
+      const res = data as Exclude<
+        WorkerResponse,
+        ScanProgressEvent | LoadProgressEvent | BlastProgressEvent | BarcodeProgressEvent
+      >;
       const call = this.pending.get(res.reqId);
       if (!call) return;
       this.pending.delete(res.reqId);
@@ -143,6 +166,22 @@ export class WgsWorkerClient {
 
   searchGenes(query: string, limit = 25): Promise<GffFeature[]> {
     return this.call<GffFeature[]>('search_genes', { query, limit });
+  }
+
+  runBlast(payload: BlastRunPayload): Promise<BlastSearchResult> {
+    return this.call<BlastSearchResult>('run_blast', payload);
+  }
+
+  cancelBlast(): Promise<boolean> {
+    return this.call<boolean>('cancel_blast');
+  }
+
+  scanBarcodes(payload: BarcodeScanPayload): Promise<BarcodeScanResult> {
+    return this.call<BarcodeScanResult>('scan_barcodes', payload);
+  }
+
+  cancelBarcodeScan(): Promise<boolean> {
+    return this.call<boolean>('cancel_barcode_scan');
   }
 
   dispose() {
