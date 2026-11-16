@@ -1,0 +1,8 @@
+node_modules/
+__pycache__/
+*.pyc
+.viewer_server.pid
+tsconfig.tsbuildinfo
+*.log
+.DS_Store
+Thumbs.db
