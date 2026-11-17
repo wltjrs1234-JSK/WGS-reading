@@ -19,6 +19,11 @@ import type {
   VariantRecord,
 } from '../bio/types';
 import type { WindowQueryResult } from '../workers/wgsProtocol';
+import {
+  FONT_CHANGE_EVENT,
+  formatCanvasFont,
+  getActiveCanvasFontConfig,
+} from '../utils/fontSettings';
 
 export type InteractionMode = 'pan' | 'select';
 
@@ -304,13 +309,20 @@ export const GenomeCanvasViewer: React.FC<GenomeCanvasViewerProps> = ({
   const lastHoverCommitRef = useRef<number>(0);
 
   const getMeasureCtx = (): CanvasRenderingContext2D | null => {
+    const fontCfg = getActiveCanvasFontConfig();
     if (!measureCtxRef.current && typeof document !== 'undefined') {
       const c = document.createElement('canvas');
       const mctx = c.getContext('2d');
       if (mctx) {
-        mctx.font = '600 10.5px ui-sans-serif, system-ui, sans-serif';
         measureCtxRef.current = mctx;
       }
+    }
+    if (measureCtxRef.current) {
+      measureCtxRef.current.font = formatCanvasFont(
+        fontCfg.uiFontFamily,
+        10.5 + fontCfg.canvasDeltaPx,
+        600,
+      );
     }
     return measureCtxRef.current;
   };
@@ -574,6 +586,12 @@ export const GenomeCanvasViewer: React.FC<GenomeCanvasViewerProps> = ({
     const span = Math.max(1, effectiveEnd - effectiveStart);
     const pxPerBp = trackW / span;
     const toX = (pos: number) => LEFT_LABEL_W + (pos - effectiveStart) * pxPerBp;
+    const fontCfg = getActiveCanvasFontConfig();
+    const cUi = (px: number, weight: 'normal' | 'bold' | number = 'normal') =>
+      formatCanvasFont(fontCfg.uiFontFamily, px + fontCfg.canvasDeltaPx, weight);
+    const cMono = (px: number, weight: 'normal' | 'bold' | number = 'normal') =>
+      formatCanvasFont(fontCfg.monoFontFamily, px + fontCfg.canvasDeltaPx, weight);
+    const readBaseFontPx = Math.min(9.5, Math.max(8, 8.5 + fontCfg.canvasDeltaPx * 0.4));
 
     ctx.fillStyle = '#ffffff';
     ctx.fillRect(0, 0, w, h);
@@ -597,7 +615,7 @@ export const GenomeCanvasViewer: React.FC<GenomeCanvasViewerProps> = ({
     ctx.stroke();
 
     ctx.fillStyle = '#475569';
-    ctx.font = '10px ui-sans-serif, system-ui, sans-serif';
+    ctx.font = cUi(10, 600);
     ctx.textBaseline = 'middle';
     ctx.fillText('bp', 8, curLayout.rulerY + 14);
 
@@ -608,7 +626,7 @@ export const GenomeCanvasViewer: React.FC<GenomeCanvasViewerProps> = ({
 
     const tickStep = niceTickStep(span, Math.floor(trackW / 110));
     const firstTick = Math.ceil(effectiveStart / tickStep) * tickStep;
-    ctx.font = '10px ui-sans-serif, system-ui, sans-serif';
+    ctx.font = cMono(10, 500);
     ctx.textBaseline = 'top';
 
     for (let t = firstTick; t <= effectiveEnd; t += tickStep) {
@@ -638,7 +656,7 @@ export const GenomeCanvasViewer: React.FC<GenomeCanvasViewerProps> = ({
         if (pxPerBp >= 8) {
           ctx.fillRect(x0 + 0.3, curLayout.refY + 2, Math.max(1, bw - 0.6), REF_TRACK_H - 4);
           ctx.fillStyle = '#ffffff';
-          ctx.font = 'bold 10px ui-monospace, monospace';
+          ctx.font = cMono(10, 'bold');
           ctx.textBaseline = 'middle';
           ctx.textAlign = 'center';
           ctx.fillText(base, x0 + bw / 2, curLayout.refY + REF_TRACK_H / 2 + 0.5);
@@ -649,7 +667,7 @@ export const GenomeCanvasViewer: React.FC<GenomeCanvasViewerProps> = ({
       }
     } else {
       ctx.fillStyle = '#64748b';
-      ctx.font = '10px ui-sans-serif, sans-serif';
+      ctx.font = cUi(10.5);
       ctx.textBaseline = 'middle';
       ctx.fillText(
         '조감 모드 (Ctrl+휠로 30 kb 이하 확대 시 염기 및 리드 표시)',
@@ -729,7 +747,7 @@ export const GenomeCanvasViewer: React.FC<GenomeCanvasViewerProps> = ({
       }
 
       // Track Title Pill
-      ctx.font = '600 11px ui-sans-serif, system-ui, sans-serif';
+      ctx.font = cUi(11, 600);
       const pillText = s.matchedChrom ? s.label : `${s.label} (미매칭)`;
       const pillW = Math.min(220, ctx.measureText(pillText).width + 14);
       ctx.fillStyle = 'rgba(255, 255, 255, 0.92)';
@@ -824,9 +842,11 @@ export const GenomeCanvasViewer: React.FC<GenomeCanvasViewerProps> = ({
               if (pxPerBp >= 7) {
                 ctx.globalAlpha = isMismatch ? qualAlpha : 1;
                 ctx.fillStyle = isMismatch ? '#ffffff' : '#1e293b';
-                ctx.font = isMismatch
-                  ? 'bold 8.5px ui-monospace, monospace'
-                  : '8.5px ui-monospace, monospace';
+                ctx.font = formatCanvasFont(
+                  fontCfg.monoFontFamily,
+                  readBaseFontPx,
+                  isMismatch ? 'bold' : 'normal',
+                );
                 ctx.textAlign = 'center';
                 ctx.textBaseline = 'middle';
                 ctx.fillText(b.base, bx + bw / 2, ry + READ_ROW_H / 2 + 0.5);
@@ -848,15 +868,15 @@ export const GenomeCanvasViewer: React.FC<GenomeCanvasViewerProps> = ({
 
         if (s.totalRows > MAX_VISIBLE_ROWS) {
           ctx.fillStyle = 'rgba(255, 255, 255, 0.92)';
-          ctx.fillRect(w - 132, s.pileupY + s.pileupH - 18, 126, 16);
+          ctx.fillRect(w - 138, s.pileupY + s.pileupH - 19, 132, 17);
           ctx.strokeStyle = '#cbd5e1';
-          ctx.strokeRect(w - 132, s.pileupY + s.pileupH - 18, 126, 16);
+          ctx.strokeRect(w - 138, s.pileupY + s.pileupH - 19, 132, 17);
           ctx.fillStyle = '#475569';
-          ctx.font = '600 10px ui-sans-serif, sans-serif';
+          ctx.font = cUi(10, 600);
           ctx.fillText(
             `+${s.totalRows - MAX_VISIBLE_ROWS}개 리드 더 있음`,
-            w - 126,
-            s.pileupY + s.pileupH - 7,
+            w - 132,
+            s.pileupY + s.pileupH - 8,
           );
         }
 
@@ -877,7 +897,7 @@ export const GenomeCanvasViewer: React.FC<GenomeCanvasViewerProps> = ({
       ctx.strokeRect(LEFT_LABEL_W + 16, curLayout.emptyHintY + 12, trackW - 32, 72);
       ctx.setLineDash([]);
       ctx.fillStyle = '#334155';
-      ctx.font = '600 12px ui-sans-serif, system-ui, sans-serif';
+      ctx.font = cUi(12, 600);
       ctx.textAlign = 'center';
       ctx.textBaseline = 'middle';
       ctx.fillText(
@@ -940,7 +960,7 @@ export const GenomeCanvasViewer: React.FC<GenomeCanvasViewerProps> = ({
           }
 
           if (pxPerBp >= 7) {
-            ctx.font = 'bold 9.5px ui-monospace, monospace';
+            ctx.font = cMono(9.5, 'bold');
             ctx.textAlign = 'center';
             ctx.textBaseline = 'middle';
 
@@ -1071,7 +1091,7 @@ export const GenomeCanvasViewer: React.FC<GenomeCanvasViewerProps> = ({
               ? Math.max(fx0 + 28, Math.min(fx1 - 28, (fx0 + fx1) / 2))
               : trueMidX;
           ctx.fillStyle = isHighlighted ? '#92400e' : '#00008b';
-          ctx.font = '600 10.5px ui-sans-serif, system-ui, sans-serif';
+          ctx.font = cUi(10.5, 600);
           ctx.textAlign = 'center';
           ctx.textBaseline = 'top';
           ctx.fillText(feat.name, visMidX, laneTop + 18, Math.max(60, fw + 30));
@@ -1153,7 +1173,7 @@ export const GenomeCanvasViewer: React.FC<GenomeCanvasViewerProps> = ({
             : `${(sel.start + 1).toLocaleString()}–${sel.end.toLocaleString()} (${(
                 sel.end - sel.start
               ).toLocaleString()} bp)`;
-        ctx.font = '600 10px ui-monospace, monospace';
+        ctx.font = cMono(10, 600);
         const bw = ctx.measureText(badgeText).width + 16;
         const bx = Math.min(w - bw - 6, Math.max(LEFT_LABEL_W + 4, sx0));
         ctx.fillStyle = '#0284c7';
@@ -1168,7 +1188,7 @@ export const GenomeCanvasViewer: React.FC<GenomeCanvasViewerProps> = ({
 
     // Left Gutter Labels & IGV Coverage Y-Axis Scale
     ctx.fillStyle = '#475569';
-    ctx.font = '10px ui-sans-serif, system-ui, sans-serif';
+    ctx.font = cUi(10.5, 600);
     ctx.textBaseline = 'middle';
     ctx.fillText('Reference', 8, curLayout.refY + REF_TRACK_H / 2);
 
@@ -1183,7 +1203,7 @@ export const GenomeCanvasViewer: React.FC<GenomeCanvasViewerProps> = ({
       ctx.stroke();
 
       ctx.fillStyle = '#475569';
-      ctx.font = '10px ui-monospace, monospace';
+      ctx.font = cMono(10);
       ctx.textAlign = 'right';
       ctx.textBaseline = 'top';
       ctx.fillText(String(visibleCovMax.get(s.id) ?? s.maxBinDepth), axisX - 7, s.covY + 3);
@@ -1193,7 +1213,7 @@ export const GenomeCanvasViewer: React.FC<GenomeCanvasViewerProps> = ({
 
       if (s.pileupH > 0) {
         ctx.fillStyle = '#64748b';
-        ctx.font = '10px ui-sans-serif, sans-serif';
+        ctx.font = cMono(10);
         ctx.textBaseline = 'middle';
         ctx.fillText(`${s.meanDepth.toFixed(1)}x`, 10, s.pileupY + 14);
       }
@@ -1201,7 +1221,7 @@ export const GenomeCanvasViewer: React.FC<GenomeCanvasViewerProps> = ({
 
     if (curLayout.showCompareTrack) {
       ctx.fillStyle = '#0f172a';
-      ctx.font = '600 10.5px ui-sans-serif, system-ui, sans-serif';
+      ctx.font = cUi(10.5, 600);
       ctx.textBaseline = 'middle';
       ctx.fillText(
         curHasS2 ? '3-Way 비교' : '2-Way 비교',
@@ -1212,7 +1232,7 @@ export const GenomeCanvasViewer: React.FC<GenomeCanvasViewerProps> = ({
 
     if (curLayout.hasFeatures) {
       ctx.fillStyle = '#334155';
-      ctx.font = '600 10.5px ui-sans-serif, system-ui, sans-serif';
+      ctx.font = cUi(10.5, 600);
       ctx.textBaseline = 'middle';
       ctx.fillText('RefSeq / SGD', 8, curLayout.geneY + 18);
     }
@@ -1354,9 +1374,13 @@ export const GenomeCanvasViewer: React.FC<GenomeCanvasViewerProps> = ({
     };
     window.addEventListener('keydown', onKeyDown);
     window.addEventListener('mouseup', onWindowMouseUp);
+    window.addEventListener(FONT_CHANGE_EVENT, scheduleDraw);
+    document.fonts?.addEventListener?.('loadingdone', scheduleDraw);
     return () => {
       window.removeEventListener('keydown', onKeyDown);
       window.removeEventListener('mouseup', onWindowMouseUp);
+      window.removeEventListener(FONT_CHANGE_EVENT, scheduleDraw);
+      document.fonts?.removeEventListener?.('loadingdone', scheduleDraw);
       stopGlideLoop();
       if (drawRafRef.current !== null) window.cancelAnimationFrame(drawRafRef.current);
       if (syncTimerRef.current !== null) window.clearTimeout(syncTimerRef.current);
@@ -1671,9 +1695,9 @@ export const GenomeCanvasViewer: React.FC<GenomeCanvasViewerProps> = ({
 
       {hoverInfo && (
         <div
-          className="pointer-events-none absolute z-20 rounded-lg border border-slate-300 bg-white/95 px-2.5 py-1.5 text-[11px] text-slate-800 shadow-lg backdrop-blur"
+          className="pointer-events-none absolute z-20 rounded-lg border border-slate-300 bg-white/95 px-3 py-2 text-xs text-slate-800 shadow-lg backdrop-blur"
           style={{
-            left: Math.min(size.width - 240, hoverInfo.x + 14),
+            left: Math.min(size.width - 260, hoverInfo.x + 14),
             top: Math.max(8, hoverInfo.y + 14),
           }}
         >
@@ -1681,7 +1705,7 @@ export const GenomeCanvasViewer: React.FC<GenomeCanvasViewerProps> = ({
             {data.chrom}:{(hoverInfo.pos + 1).toLocaleString()}
           </div>
           {hoverInfo.refBase && (
-            <div className="mt-0.5 flex gap-2 font-mono text-[10px]">
+            <div className="mt-0.5 flex gap-2 font-mono text-[11px]">
               <span className="text-slate-700">Ref:{hoverInfo.refBase}</span>
               {hoverInfo.s1Call !== undefined && (
                 <span className="font-semibold text-sky-700">
@@ -1696,14 +1720,14 @@ export const GenomeCanvasViewer: React.FC<GenomeCanvasViewerProps> = ({
             </div>
           )}
           {hoverInfo.feature && (
-            <div className="mt-1 border-t border-slate-200 pt-1 text-[10px] text-blue-800">
+            <div className="mt-1 border-t border-slate-200 pt-1 text-[11px] text-blue-800">
               유전자: <b>{hoverInfo.feature.name}</b> ({hoverInfo.feature.strand},{' '}
               {(hoverInfo.feature.start + 1).toLocaleString()}–
               {hoverInfo.feature.end.toLocaleString()}) — 클릭해 서열 추출
             </div>
           )}
           {hoverInfo.read && (
-            <div className="mt-1 border-t border-slate-200 pt-1 font-mono text-[10px] text-slate-600">
+            <div className="mt-1 border-t border-slate-200 pt-1 font-mono text-[11px] text-slate-600">
               <div>{hoverInfo.read.name}</div>
               <div>
                 CIGAR: {hoverInfo.read.cigar} · MAPQ: {hoverInfo.read.mapq} · {hoverInfo.read.strand}

@@ -102,19 +102,19 @@ const BlastHitAlignmentDetail: React.FC<{ hit: BlastHitWithStrains }> = ({ hit }
 
   return (
     <div className="space-y-2 rounded-xl border border-slate-200 bg-slate-50 p-3.5">
-      <div className="flex flex-wrap items-center justify-between gap-2 text-xs">
+      <div className="flex flex-wrap items-center justify-between gap-2 text-[13px]">
         <div className="flex flex-wrap items-center gap-2">
           <span className="font-bold text-slate-900">
             선택 Hit 정렬 상세 ({hit.chrom}:{(hit.refStart + 1).toLocaleString()}–
             {hit.refEnd.toLocaleString()} · {hit.strand === '+' ? '정방향 (+)' : '역상보 (-)'})
           </span>
-          <span className="font-mono text-[11px] text-slate-600">
+          <span className="font-mono text-xs text-slate-700">
             Query {(hit.qStart + 1).toLocaleString()}–{hit.qEnd.toLocaleString()} /{' '}
             {hit.queryLen.toLocaleString()} bp · Ref 일치 {hit.identities}/{hit.alignLen} (
             {hit.identityPct}%) · Mismatch {hit.mismatches} · Gap {hit.gaps}
           </span>
         </div>
-        <div className="flex items-center gap-2 text-[10px] text-slate-600">
+        <div className="flex flex-wrap items-center gap-2.5 text-xs text-slate-700">
           <span className="font-semibold text-indigo-700">■ Ref vs Query 차이</span>
           <span className="font-semibold text-sky-700">■ 균주 vs Query 차이</span>
           <span className="font-semibold text-amber-700">■ 저심도(N)</span>
@@ -122,7 +122,7 @@ const BlastHitAlignmentDetail: React.FC<{ hit: BlastHitWithStrains }> = ({ hit }
         </div>
       </div>
 
-      <div className="max-h-60 space-y-2.5 overflow-x-auto overflow-y-auto rounded-lg border border-slate-200 bg-white p-3 font-mono text-[11px] leading-[18px]">
+      <div className="max-h-80 space-y-3 overflow-x-auto overflow-y-auto rounded-lg border border-slate-200 bg-white p-3.5 font-mono text-[14px] leading-[22px] tracking-wide">
         {blocks.slice(0, 120).map((b) => {
           const qSlice = hit.alignedQueryDisplay.slice(b.start, b.end);
           const rSlice = hit.alignedRefDisplay.slice(b.start, b.end);
@@ -132,22 +132,24 @@ const BlastHitAlignmentDetail: React.FC<{ hit: BlastHitWithStrains }> = ({ hit }
             .join('');
 
           return (
-            <div key={b.start} className="space-y-0.5">
-              <div className="text-[10px] text-slate-400">
+            <div key={b.start} className="space-y-1 border-b border-slate-100 pb-2.5 last:border-b-0 last:pb-0">
+              <div className="text-xs font-medium text-slate-600">
                 Col {(b.start + 1).toLocaleString()}–{b.end.toLocaleString()}
               </div>
-              <div className="whitespace-nowrap">
-                <span className="mr-2 inline-block w-28 truncate font-semibold text-indigo-700">
+              <div className="flex items-baseline whitespace-nowrap">
+                <span className="mr-2.5 inline-block w-36 shrink-0 truncate border-r border-slate-200 pr-2.5 text-[13px] font-bold text-indigo-700">
                   Query
                 </span>
-                <span className="text-slate-900">{qSlice}</span>
+                <span className="font-medium text-slate-900">{qSlice}</span>
               </div>
-              <div className="whitespace-nowrap text-slate-400 select-none">
-                <span className="mr-2 inline-block w-28 truncate text-[10px]">Ref 일치</span>
+              <div className="flex items-baseline whitespace-nowrap text-slate-400 select-none">
+                <span className="mr-2.5 inline-block w-36 shrink-0 truncate border-r border-slate-200 pr-2.5 font-sans text-xs font-medium text-slate-500">
+                  Ref 일치
+                </span>
                 <span>{midSlice}</span>
               </div>
-              <div className="whitespace-nowrap">
-                <span className="mr-2 inline-block w-28 truncate font-semibold text-emerald-700">
+              <div className="flex items-baseline whitespace-nowrap">
+                <span className="mr-2.5 inline-block w-36 shrink-0 truncate border-r border-slate-200 pr-2.5 text-[13px] font-bold text-emerald-700">
                   Reference
                 </span>
                 {renderAlignedDiffLine(
@@ -164,9 +166,9 @@ const BlastHitAlignmentDetail: React.FC<{ hit: BlastHitWithStrains }> = ({ hit }
                     ? 'bg-sky-200 font-bold text-sky-950'
                     : 'bg-teal-200 font-bold text-teal-950';
                 return (
-                  <div key={st.id} className="whitespace-nowrap">
+                  <div key={st.id} className="flex items-baseline whitespace-nowrap">
                     <span
-                      className={`mr-2 inline-block w-28 truncate font-semibold ${labelClr}`}
+                      className={`mr-2.5 inline-block w-36 shrink-0 truncate border-r border-slate-200 pr-2.5 text-[13px] font-bold ${labelClr}`}
                       title={st.label}
                     >
                       {st.label}
@@ -179,7 +181,7 @@ const BlastHitAlignmentDetail: React.FC<{ hit: BlastHitWithStrains }> = ({ hit }
           );
         })}
         {blocks.length > 120 && (
-          <div className="py-1 text-center font-sans text-[11px] text-slate-500">
+          <div className="py-1.5 text-center font-sans text-xs text-slate-600">
             매우 긴 서열 정렬: 처음 7,200 컬럼만 미리 표시했습니다. (전체 상세는 뷰어 이동 후 서열 추출에서 확인 가능)
           </div>
         )}

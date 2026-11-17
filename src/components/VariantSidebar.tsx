@@ -11,12 +11,13 @@ import {
   Square,
 } from 'lucide-react';
 import type { ConsensusOptions, ContigInfo, DiffCategory, GffFeature, VariantRecord } from '../bio/types';
-import type { AnnotationOrigin, ScanProgressEvent, TrackSummaryMeta } from '../workers/wgsProtocol';
+import type { AnnotationOrigin, ScanProgressEvent, TrackSummaryMeta, VariantScanScope } from '../workers/wgsProtocol';
 
 interface VariantSidebarProps {
   chrom: string;
   windowVariants: VariantRecord[];
   scannedVariants: VariantRecord[];
+  scanScope: VariantScanScope;
   isScanning: boolean;
   scanProgress: ScanProgressEvent | null;
   hasGff: boolean;
@@ -27,8 +28,9 @@ interface VariantSidebarProps {
   options: ConsensusOptions;
   contigOverrides: Record<string, Record<string, string>>;
   refContigs: ContigInfo[];
-  onStartScan: () => void;
+  onStartScan: (scope: VariantScanScope) => void;
   onCancelScan: () => void;
+  onOpenAnnotationModal: () => void;
   onJumpToRange: (chrom: string, start: number, end: number) => void;
   onJumpToChrom: (chrom: string) => void;
   onExtractFeature: (feat: GffFeature) => void;
@@ -65,6 +67,7 @@ export const VariantSidebar: React.FC<VariantSidebarProps> = ({
   chrom,
   windowVariants,
   scannedVariants,
+  scanScope,
   isScanning,
   scanProgress,
   hasGff,
@@ -77,6 +80,7 @@ export const VariantSidebar: React.FC<VariantSidebarProps> = ({
   refContigs,
   onStartScan,
   onCancelScan,
+  onOpenAnnotationModal,
   onJumpToRange,
   onJumpToChrom,
   onExtractFeature,
@@ -99,6 +103,12 @@ export const VariantSidebar: React.FC<VariantSidebarProps> = ({
   const activeVariants = scannedVariants.length > 0 ? scannedVariants : windowVariants;
   const filteredVariants = useMemo(() => {
     if (filterCat === 'all') return activeVariants;
+    if (filterCat === 'impact_HIGH') {
+      return activeVariants.filter((v) => v.annotation?.impact === 'HIGH');
+    }
+    if (filterCat === 'impact_MODERATE') {
+      return activeVariants.filter((v) => v.annotation?.impact === 'MODERATE');
+    }
     if (filterCat === 'gaps') {
       return activeVariants.filter(
         (v) => v.category === 'gap_s1' || v.category === 'gap_s2' || v.category === 'gap_both',
@@ -167,11 +177,11 @@ export const VariantSidebar: React.FC<VariantSidebarProps> = ({
       {/* Tab 1: Variants */}
       {tab === 'variants' && (
         <div className="flex flex-1 flex-col overflow-hidden">
-          <div className="space-y-2.5 border-b border-slate-200 bg-white p-3">
-            <div className="flex items-center justify-between gap-2">
+          <div className="space-y-2 border-b border-slate-200 bg-white p-3">
+            <div className="flex flex-wrap items-center justify-between gap-1.5">
               <span className="text-xs font-bold text-slate-800">
                 {scannedVariants.length > 0
-                  ? `${chrom} 전체 스캔 (${scannedVariants.length}건)`
+                  ? `${scanScope === 'all_chroms' ? '전체 17chr' : chrom} 스캔 (${scannedVariants.length}건)`
                   : `현재 화면 변이 (${windowVariants.length}건)`}
               </span>
               {isScanning ? (
@@ -183,15 +193,35 @@ export const VariantSidebar: React.FC<VariantSidebarProps> = ({
                   <Square className="h-3 w-3" /> 중지
                 </button>
               ) : (
-                <button
-                  type="button"
-                  onClick={onStartScan}
-                  className="inline-flex items-center gap-1 rounded-lg bg-sky-100 px-2.5 py-1 text-[11px] font-semibold text-sky-800 hover:bg-sky-200"
-                >
-                  <Radar className="h-3.5 w-3.5" /> 염색체 스캔
-                </button>
+                <div className="flex items-center gap-1">
+                  <button
+                    type="button"
+                    onClick={() => onStartScan('current_chrom')}
+                    className="inline-flex items-center gap-1 rounded-lg bg-sky-100 px-2 py-1 text-[11px] font-semibold text-sky-800 hover:bg-sky-200"
+                    title="현재 보고 있는 염색체 전체 변이 및 단백질 영향 스캔"
+                  >
+                    <Radar className="h-3 w-3" /> 염색체
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => onStartScan('all_chroms')}
+                    className="inline-flex items-center gap-1 rounded-lg bg-indigo-100 px-2 py-1 text-[11px] font-semibold text-indigo-800 hover:bg-indigo-200"
+                    title="전체 17개 염색체 코딩 변이 및 아미노산 변화 일괄 스캔"
+                  >
+                    전체17chr
+                  </button>
+                </div>
               )}
             </div>
+
+            <button
+              type="button"
+              onClick={onOpenAnnotationModal}
+              className="flex w-full items-center justify-center gap-1.5 rounded-lg border border-rose-200 bg-rose-50/70 px-2.5 py-1.5 text-[11px] font-semibold text-rose-800 hover:bg-rose-100"
+            >
+              <AlertTriangle className="h-3.5 w-3.5" />
+              유전자별 변이 요약 · VCF / TSV 내보내기
+            </button>
 
             {isScanning && scanProgress && (
               <div className="space-y-1">
@@ -208,7 +238,7 @@ export const VariantSidebar: React.FC<VariantSidebarProps> = ({
                 </div>
                 <div className="flex justify-between text-[10px] text-slate-600">
                   <span>
-                    {scanProgress.scannedBp.toLocaleString()} / {scanProgress.totalBp.toLocaleString()} bp
+                    {scanProgress.chrom} ({scanProgress.scannedBp.toLocaleString()} bp)
                   </span>
                   <span>{scanProgress.variantsSoFar}건 발견</span>
                 </div>
@@ -223,6 +253,8 @@ export const VariantSidebar: React.FC<VariantSidebarProps> = ({
                 className="flex-1 rounded-lg border border-slate-300 bg-white px-2 py-1 text-xs text-slate-800"
               >
                 <option value="all">모든 차이 보기 ({activeVariants.length})</option>
+                <option value="impact_HIGH">영향도: HIGH (종결·틀이동·결실)</option>
+                <option value="impact_MODERATE">영향도: MODERATE (미스센스·인프레임)</option>
                 {hasStrain2 ? (
                   <>
                     <option value="strain1_only">균주 1 특이 변이</option>
@@ -251,26 +283,49 @@ export const VariantSidebar: React.FC<VariantSidebarProps> = ({
             ) : (
               filteredVariants.slice(0, 400).map((v, idx) => {
                 const badge = labelMap[v.category];
+                const ann = v.annotation;
+                const impactCls =
+                  ann?.impact === 'HIGH'
+                    ? 'bg-rose-100 text-rose-800 border-rose-200'
+                    : ann?.impact === 'MODERATE'
+                      ? 'bg-amber-100 text-amber-800 border-amber-200'
+                      : ann?.impact === 'LOW'
+                        ? 'bg-sky-50 text-sky-700 border-sky-200'
+                        : 'bg-slate-100 text-slate-600 border-slate-200';
                 return (
                   <button
-                    key={`${v.start}_${idx}`}
+                    key={`${v.chrom}_${v.start}_${idx}`}
                     type="button"
                     onClick={() => {
                       const pad = Math.max(80, Math.round((v.end - v.start) * 1.5));
                       onJumpToRange(v.chrom, Math.max(0, v.start - pad), v.end + pad);
                     }}
-                    className="w-full rounded-lg border border-slate-200 bg-white p-2.5 text-left shadow-2xs transition hover:border-sky-400 hover:bg-sky-50/40"
+                    className="w-full rounded-lg border border-slate-200 bg-white p-3 text-left shadow-2xs transition hover:border-sky-400 hover:bg-sky-50/40"
                   >
                     <div className="flex items-center justify-between gap-2">
-                      <span className="font-mono text-xs font-bold text-slate-900">
+                      <span className="font-mono text-[13px] font-bold text-slate-900">
+                        {scanScope === 'all_chroms' ? `${v.chrom}:` : ''}
                         {(v.start + 1).toLocaleString()}
                         {v.end - v.start > 1 ? `–${v.end.toLocaleString()}` : ''}
                       </span>
-                      <span className={`rounded px-1.5 py-0.5 text-[10px] font-semibold ${badge.badge}`}>
+                      <span className={`rounded-md px-2 py-0.5 text-xs font-semibold ${badge.badge}`}>
                         {badge.text} · {v.type}
                       </span>
                     </div>
-                    <div className="mt-1 flex items-center gap-2 truncate font-mono text-[11px] text-slate-600">
+                    {ann && ann.geneName !== 'Intergenic' && (
+                      <div className="mt-1.5 flex flex-wrap items-center gap-1.5 text-xs">
+                        <span className={`rounded border px-1.5 py-0.5 font-bold ${impactCls}`}>
+                          {ann.impact}
+                        </span>
+                        <span className="font-semibold text-slate-900">{ann.geneName}</span>
+                        {(ann.hgvsP || ann.hgvsC) && (
+                          <span className="font-mono font-bold text-indigo-700">
+                            {ann.hgvsP ?? ann.hgvsC}
+                          </span>
+                        )}
+                      </div>
+                    )}
+                    <div className="mt-1.5 flex items-center gap-2 truncate font-mono text-xs font-medium text-slate-700">
                       <span>Ref:{v.refAllele.slice(0, 8)}</span>
                       <span>→</span>
                       <span className="font-semibold text-sky-700">
@@ -294,14 +349,14 @@ export const VariantSidebar: React.FC<VariantSidebarProps> = ({
       {tab === 'genes' && (
         <div className="flex flex-1 flex-col space-y-3 overflow-hidden p-3">
           {!hasGff ? (
-            <div className="py-10 text-center text-xs text-slate-500">
+            <div className="py-10 text-center text-[13px] text-slate-600">
               유전자 주석 정보가 없습니다. SGD .gff3 파일을 첨부하거나 S. cerevisiae 레퍼런스 FASTA를 불러오면 유전자 검색이 활성화됩니다.
             </div>
           ) : (
             <>
-              <div className="flex items-center justify-between text-[11px] text-slate-600">
-                <span>유전자 주석 소스:</span>
-                <span className="rounded bg-violet-100 px-2 py-0.5 font-semibold text-violet-800">
+              <div className="flex items-center justify-between text-xs text-slate-700">
+                <span className="font-medium">유전자 주석 소스:</span>
+                <span className="rounded-md bg-violet-100 px-2.5 py-0.5 font-semibold text-violet-900">
                   {annotationOrigin === 'builtin_s288c'
                     ? '내장 S288C R64 (자동)'
                     : annotationOrigin === 'user_gff'
@@ -310,13 +365,13 @@ export const VariantSidebar: React.FC<VariantSidebarProps> = ({
                 </span>
               </div>
               <div className="relative">
-                <Search className="absolute left-2.5 top-2 h-4 w-4 text-slate-400" />
+                <Search className="absolute left-2.5 top-2.5 h-4 w-4 text-slate-400" />
                 <input
                   type="text"
                   value={geneQuery}
                   onChange={(e) => handleGeneSearch(e.target.value)}
                   placeholder="유전자명 검색 (예: URA3, LEU2, ACT1, COX1)"
-                  className="w-full rounded-lg border border-slate-300 bg-white py-1.5 pl-8 pr-3 text-xs text-slate-900 focus:border-sky-500 focus:outline-none"
+                  className="w-full rounded-lg border border-slate-300 bg-white py-2 pl-8 pr-3 text-[13px] text-slate-900 focus:border-sky-500 focus:outline-none"
                 />
               </div>
               <div className="flex-1 space-y-1.5 overflow-y-auto">

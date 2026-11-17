@@ -1,10 +1,12 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
+  AlertTriangle,
   AlignJustify,
   Crosshair,
   Dna,
   FolderOpen,
   Hand,
+  Layers,
   Maximize2,
   PanelRight,
   Plus,
@@ -12,10 +14,12 @@ import {
   Scissors,
   Search,
   SlidersHorizontal,
+  Type,
   X,
   ZoomIn,
   ZoomOut,
 } from 'lucide-react';
+import type { CnvSvAnalysisResult } from './bio/cnvSvAnalyzer';
 import {
   DEFAULT_CONSENSUS_OPTIONS,
   type ConsensusOptions,
@@ -26,11 +30,20 @@ import { AllChromsOverviewCanvas } from './components/AllChromsOverviewCanvas';
 import { BarcodeScannerModal } from './components/BarcodeScannerModal';
 import { BlastModal } from './components/BlastModal';
 import { ChromosomeIdeogram } from './components/ChromosomeIdeogram';
+import { CnvSvModal } from './components/CnvSvModal';
 import { FileLoaderModal } from './components/FileLoaderModal';
+import { FontSettingsModal } from './components/FontSettingsModal';
 import { GenomeCanvasViewer, type InteractionMode } from './components/GenomeCanvasViewer';
 import { SequenceExtractorModal } from './components/SequenceExtractorModal';
+import { VariantAnnotationModal } from './components/VariantAnnotationModal';
 import { VariantSidebar } from './components/VariantSidebar';
 import { matchDroppedFiles } from './utils/fileMatcher';
+import {
+  applyFontSettings,
+  loadFontSettings,
+  saveFontSettings,
+  type FontSettings,
+} from './utils/fontSettings';
 import { WgsWorkerClient } from './workers/wgsClient';
 import type {
   AllChromsOverviewResult,
@@ -40,10 +53,13 @@ import type {
   BlastProgressEvent,
   BlastRunPayload,
   BlastSearchResult,
+  CnvProgressEvent,
+  CnvSvPayload,
   ExtractionResult,
   LoadLocalFilesPayload,
   ScanProgressEvent,
   StrainFileInput,
+  VariantScanScope,
   WindowQueryResult,
   WorkspaceLoadedSummary,
 } from './workers/wgsProtocol';
@@ -67,7 +83,7 @@ function computeBufferedWindowRange(targetStart: number, targetEnd: number, chro
   const vEnd = Math.min(safeLen, Math.max(vStart + 1, vStart + vSpan));
   const pad =
     vSpan <= 6_000
-      ? Math.min(2_500, Math.max(600, Math.round(vSpan * 0.55)))
+      ? Math.min(900, Math.max(300, Math.round(vSpan * 0.3)))
       : vSpan <= 30_000
         ? Math.min(2_000, Math.max(0, Math.floor((30_000 - vSpan) / 2)))
         : Math.round(vSpan * 0.2);
@@ -114,6 +130,7 @@ export default function App() {
   const [loaderMode, setLoaderMode] = useState<'tracks' | 'genome'>('tracks');
   const [isLoadingFiles, setIsLoadingFiles] = useState(false);
   const [loadingMessage, setLoadingMessage] = useState<string | null>(null);
+  const [loadingElapsedSec, setLoadingElapsedSec] = useState(0);
   const [loaderError, setLoaderError] = useState<string | null>(null);
   const [dropError, setDropError] = useState<string | null>(null);
   const [isWindowDragOver, setIsWindowDragOver] = useState(false);
@@ -128,8 +145,10 @@ export default function App() {
   const [extractFeature, setExtractFeature] = useState<GffFeature | null>(null);
 
   const [scannedVariants, setScannedVariants] = useState<VariantRecord[]>([]);
+  const [scanScope, setScanScope] = useState<VariantScanScope>('current_chrom');
   const [isScanning, setIsScanning] = useState(false);
   const [scanProgress, setScanProgress] = useState<ScanProgressEvent | null>(null);
+  const [isAnnotationModalOpen, setIsAnnotationModalOpen] = useState(false);
 
   const [isBlastOpen, setIsBlastOpen] = useState(false);
   const [isBlasting, setIsBlasting] = useState(false);
@@ -143,6 +162,21 @@ export default function App() {
   const [barcodeProgress, setBarcodeProgress] = useState<BarcodeProgressEvent | null>(null);
   const [barcodeError, setBarcodeError] = useState<string | null>(null);
   const [barcodeResult, setBarcodeResult] = useState<BarcodeScanResult | null>(null);
+
+  const [isCnvModalOpen, setIsCnvModalOpen] = useState(false);
+  const [isAnalyzingCnv, setIsAnalyzingCnv] = useState(false);
+  const [cnvProgress, setCnvProgress] = useState<CnvProgressEvent | null>(null);
+  const [cnvError, setCnvError] = useState<string | null>(null);
+  const [cnvResult, setCnvResult] = useState<CnvSvAnalysisResult | null>(null);
+
+  const [isFontModalOpen, setIsFontModalOpen] = useState(false);
+  const [fontSettings, setFontSettings] = useState<FontSettings>(() => loadFontSettings());
+
+  const handleChangeFontSettings = useCallback((next: FontSettings) => {
+    setFontSettings(next);
+    saveFontSettings(next);
+    applyFontSettings(next);
+  }, []);
 
   const currentChromLength = useMemo(() => {
     if (!workspace) return 576874;
@@ -195,6 +229,7 @@ export default function App() {
         setWindowData(res);
       }
     } catch (err) {
+      if (err instanceof Error && err.name === 'AbortError') return;
       console.error(err);
     } finally {
       isPrefetchingRef.current = false;
@@ -277,7 +312,10 @@ export default function App() {
             setLocusInput('all');
           }
         } catch (err) {
+          if (err instanceof Error && err.name === 'AbortError') return;
           console.error(err);
+          const msg = err instanceof Error ? err.message : String(err);
+          setDropError(msg);
         }
         return;
       }
@@ -309,7 +347,12 @@ export default function App() {
           );
         }
       } catch (err) {
+        if (err instanceof Error && err.name === 'AbortError') return;
         console.error(err);
+        if (ticket === latestQueryRef.current) {
+          const msg = err instanceof Error ? err.message : String(err);
+          setDropError(msg);
+        }
       }
     },
     [primaryIdx, secondaryIdx, options, contigOverrides],
@@ -329,6 +372,9 @@ export default function App() {
       },
       (barEv) => {
         setBarcodeProgress(barEv);
+      },
+      (cnvEv) => {
+        setCnvProgress(cnvEv);
       },
     );
     workerRef.current = client;
@@ -388,7 +434,7 @@ export default function App() {
     };
   }, []);
 
-  // 브라우저 창 전체에서 Ctrl+휠 페이지 확대 차단
+  // 브라우저 창 전체에서 Ctrl+휠 페이지 확대 차단 및 외부 파일 드롭 네비게이션 방지
   useEffect(() => {
     const el = appRootRef.current;
     if (!el) return;
@@ -397,8 +443,17 @@ export default function App() {
         e.preventDefault();
       }
     };
+    const preventWindowDrop = (e: DragEvent) => {
+      e.preventDefault();
+    };
     el.addEventListener('wheel', preventPageZoom, { passive: false });
-    return () => el.removeEventListener('wheel', preventPageZoom);
+    window.addEventListener('dragover', preventWindowDrop);
+    window.addEventListener('drop', preventWindowDrop);
+    return () => {
+      el.removeEventListener('wheel', preventPageZoom);
+      window.removeEventListener('dragover', preventWindowDrop);
+      window.removeEventListener('drop', preventWindowDrop);
+    };
   }, []);
 
   // 전역 Esc 키 처리
@@ -415,6 +470,18 @@ export default function App() {
       }
       if (isBarcodeOpen) {
         setIsBarcodeOpen(false);
+        return;
+      }
+      if (isAnnotationModalOpen) {
+        setIsAnnotationModalOpen(false);
+        return;
+      }
+      if (isCnvModalOpen) {
+        setIsCnvModalOpen(false);
+        return;
+      }
+      if (isFontModalOpen) {
+        setIsFontModalOpen(false);
         return;
       }
       if (isExtractorOpen) {
@@ -435,7 +502,7 @@ export default function App() {
     };
     window.addEventListener('keydown', handleEsc);
     return () => window.removeEventListener('keydown', handleEsc);
-  }, [showSearchDropdown, isBlastOpen, isBarcodeOpen, isExtractorOpen, isLoaderOpen, activeSelection, interactionMode]);
+  }, [showSearchDropdown, isBlastOpen, isBarcodeOpen, isAnnotationModalOpen, isCnvModalOpen, isFontModalOpen, isExtractorOpen, isLoaderOpen, activeSelection, interactionMode]);
 
   useEffect(() => {
     const onDocClick = (ev: MouseEvent) => {
@@ -473,6 +540,7 @@ export default function App() {
     setPrimaryIdx(0);
     setSecondaryIdx(s2Idx);
     setScannedVariants([]);
+    setCnvResult(null);
     setActiveSelection(null);
 
     if (keepCurrentLocus && chrom) {
@@ -533,6 +601,46 @@ export default function App() {
     }
   };
 
+  useEffect(() => {
+    if (!isLoadingFiles) {
+      setLoadingElapsedSec(0);
+      return;
+    }
+    setLoadingElapsedSec(0);
+    const timer = window.setInterval(() => {
+      setLoadingElapsedSec((s) => s + 1);
+    }, 1000);
+    return () => window.clearInterval(timer);
+  }, [isLoadingFiles]);
+
+  const handleCancelFileLoading = () => {
+    const client = workerRef.current;
+    if (client) {
+      client.restartWorker();
+      const url = new URL('/genomes/sacCer3.fa.gz', window.location.origin).toString();
+      void client
+        .loadSacCer3(url)
+        .then((summary) => {
+          workspaceRef.current = summary;
+          setWorkspace(summary);
+          setPrimaryIdx(0);
+          setSecondaryIdx(null);
+          return fetchWindow(
+            summary.defaultChrom,
+            summary.defaultStart,
+            summary.defaultEnd,
+            0,
+            null,
+          );
+        })
+        .catch(() => {});
+    }
+    setIsLoadingFiles(false);
+    setLoadingMessage(null);
+    setLoaderError('파일 불러오기가 중단되었습니다. 다시 시도해주세요.');
+    setDropError('파일 불러오기가 중단되었습니다. 다시 시도해주세요.');
+  };
+
   const handleLoadCustomGenome = async (payload: LoadLocalFilesPayload): Promise<boolean> => {
     const client = workerRef.current;
     if (!client) return false;
@@ -543,8 +651,9 @@ export default function App() {
     try {
       const summary = await client.loadFiles(payload);
       setContigOverrides({});
-      await applyWorkspaceSummary(summary, false);
       setIsLoaderOpen(false);
+      setLoadingMessage('첫 화면 리드 데이터 불러오는 중...');
+      await applyWorkspaceSummary(summary, false);
       return true;
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
@@ -570,8 +679,9 @@ export default function App() {
         await initPromiseRef.current;
       }
       const summary = await client.addStrains(newStrains, chrom === 'all' ? 'chrV' : chrom);
-      await applyWorkspaceSummary(summary, true);
       setIsLoaderOpen(false);
+      setLoadingMessage('첫 화면 리드 데이터 불러오는 중...');
+      await applyWorkspaceSummary(summary, true);
 
       const totalRef = summary.contigs.length;
       const refLenByChrom = new Map(summary.contigs.map((c) => [c.name, c.length]));
@@ -704,7 +814,7 @@ export default function App() {
 
   const handleChromChange = (nextChrom: string) => {
     if (!workspace) return;
-    setScannedVariants([]);
+    if (scanScope !== 'all_chroms') setScannedVariants([]);
     setActiveSelection(null);
     setHighlightedGene(null);
     if (nextChrom === 'all') {
@@ -860,14 +970,22 @@ export default function App() {
     void runExtract(feat.chrom, feat.start, feat.end, options, feat);
   };
 
-  const handleStartScan = async () => {
+  const handleStartScan = async (scope: VariantScanScope = 'current_chrom') => {
     const client = workerRef.current;
-    if (!client || !chrom || chrom === 'all') return;
+    if (!client) return;
+    const targetChrom =
+      scope === 'current_chrom'
+        ? chrom && chrom !== 'all'
+          ? chrom
+          : workspace?.contigs[0]?.name ?? 'chrI'
+        : workspace?.contigs[0]?.name ?? 'chrI';
+    setScanScope(scope);
     setIsScanning(true);
     setScanProgress(null);
     try {
       const vars = await client.scanChromosome({
-        chrom,
+        scope,
+        chrom: targetChrom,
         primaryStrainIndex: primaryIdx,
         secondaryStrainIndex: secondaryIdx,
         options,
@@ -963,6 +1081,34 @@ export default function App() {
     setActiveSelection({ start: Math.max(0, anchorPos - 10), end: Math.min(targetLen, anchorPos + 10) });
     setIsBarcodeOpen(false);
     void fetchWindow(bpChrom, viewS, viewE);
+  };
+
+  const handleStartCnvSv = async (payload: CnvSvPayload) => {
+    const client = workerRef.current;
+    if (!client) return;
+    setIsAnalyzingCnv(true);
+    setCnvError(null);
+    setCnvProgress({
+      type: 'cnv_progress',
+      message: 'CNV · 배수성(1n/2n/4n) · 전좌 탐색 준비 중...',
+      percent: 2,
+    });
+    try {
+      const res = await client.analyzeCnvSv({
+        ...payload,
+        contigOverrides,
+      });
+      setCnvResult(res);
+    } catch (err) {
+      setCnvError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setIsAnalyzingCnv(false);
+    }
+  };
+
+  const handleCancelCnvSv = async () => {
+    await workerRef.current?.cancelCnvSv();
+    setIsAnalyzingCnv(false);
   };
 
   const hasStrain2 =
@@ -1188,6 +1334,26 @@ export default function App() {
 
           <button
             type="button"
+            onClick={() => setIsAnnotationModalOpen(true)}
+            className="inline-flex items-center gap-1 rounded border border-rose-600 bg-rose-600 px-2.5 py-1 font-semibold text-white hover:bg-rose-700"
+            title="전유전체(17chr) 코딩 변이 아미노산 영향 예측(Nonsense/Frameshift/Missense) 및 VCF 내보내기"
+          >
+            <AlertTriangle className="h-3.5 w-3.5" />
+            변이 주석·VCF
+          </button>
+
+          <button
+            type="button"
+            onClick={() => setIsCnvModalOpen(true)}
+            className="inline-flex items-center gap-1 rounded border border-teal-600 bg-teal-600 px-2.5 py-1 font-semibold text-white hover:bg-teal-700"
+            title="염색체 복제수(CNV·이수성 1n/2n/4n)·LOH·염색체 간 전좌(SV) 탐지"
+          >
+            <Layers className="h-3.5 w-3.5" />
+            CNV·전좌
+          </button>
+
+          <button
+            type="button"
             onClick={() => setIsBarcodeOpen(true)}
             className="inline-flex items-center gap-1 rounded border border-amber-600 bg-amber-600 px-2.5 py-1 font-semibold text-white hover:bg-amber-700"
             title="외부 삽입 바코드(UPTAG/DNTAG·loxP·FRT) 및 미지 워터마크 스카 자동 스캔"
@@ -1207,6 +1373,16 @@ export default function App() {
           >
             <PanelRight className="h-3.5 w-3.5" />
             변이·매핑 패널
+          </button>
+
+          <button
+            type="button"
+            onClick={() => setIsFontModalOpen(true)}
+            className="inline-flex items-center gap-1 rounded border border-slate-300 bg-white px-2.5 py-1 font-semibold text-slate-800 hover:bg-slate-50"
+            title="전체 화면 글꼴, 서열 고정폭 글꼴 및 크기 설정"
+          >
+            <Type className="h-3.5 w-3.5 text-slate-600" />
+            글꼴 설정
           </button>
         </div>
       </header>
@@ -1350,9 +1526,21 @@ export default function App() {
       )}
 
       {isLoadingFiles && (
-        <div className="flex items-center gap-2 border-b border-amber-200 bg-amber-50 px-4 py-1.5 text-xs font-semibold text-amber-900">
-          <span className="inline-block h-2.5 w-2.5 animate-pulse rounded-full bg-amber-500" />
-          <span>{loadingMessage || '파일 불러오는 중...'}</span>
+        <div className="flex items-center justify-between gap-2 border-b border-amber-200 bg-amber-50 px-4 py-1.5 text-xs font-semibold text-amber-900">
+          <div className="flex items-center gap-2 min-w-0">
+            <span className="inline-block h-2.5 w-2.5 shrink-0 animate-pulse rounded-full bg-amber-500" />
+            <span className="truncate">
+              {loadingMessage || '파일 불러오는 중...'}
+              {loadingElapsedSec >= 2 ? ` (${loadingElapsedSec}초 경과)` : ''}
+            </span>
+          </div>
+          <button
+            type="button"
+            onClick={handleCancelFileLoading}
+            className="shrink-0 rounded border border-amber-400 bg-white px-2 py-0.5 text-[11px] font-semibold text-amber-900 hover:bg-amber-100"
+          >
+            중단
+          </button>
         </div>
       )}
 
@@ -1420,7 +1608,9 @@ export default function App() {
           {chrom === 'all' ? (
             <AllChromsOverviewCanvas
               data={allChromsData}
+              cnvData={cnvResult}
               onSelectChrom={(c) => handleChromChange(c)}
+              onOpenCnvModal={() => setIsCnvModalOpen(true)}
             />
           ) : (
             <GenomeCanvasViewer
@@ -1453,6 +1643,7 @@ export default function App() {
             chrom={chrom === 'all' ? workspace.contigs[0]?.name ?? 'chrI' : chrom}
             windowVariants={windowData?.analysis?.variants ?? []}
             scannedVariants={scannedVariants}
+            scanScope={scanScope}
             isScanning={isScanning}
             scanProgress={scanProgress}
             hasGff={workspace.gffCount > 0}
@@ -1463,10 +1654,11 @@ export default function App() {
             options={options}
             contigOverrides={contigOverrides}
             refContigs={workspace.contigs}
-            onStartScan={() => void handleStartScan()}
+            onStartScan={(sc) => void handleStartScan(sc)}
             onCancelScan={() => void handleCancelScan()}
+            onOpenAnnotationModal={() => setIsAnnotationModalOpen(true)}
             onJumpToRange={(targetChr, s, e) => {
-              if (targetChr !== chrom) setScannedVariants([]);
+              if (targetChr !== chrom && scanScope !== 'all_chroms') setScannedVariants([]);
               void fetchWindow(targetChr, s, e);
             }}
             onJumpToChrom={handleChromChange}
@@ -1507,8 +1699,10 @@ export default function App() {
         activeGenomeLabel={workspace?.referenceLabel ?? 'sacCer3'}
         isLoading={isLoadingFiles}
         loadingMsg={loadingMessage}
+        elapsedSec={loadingElapsedSec}
         errorMsg={loaderError}
         onClose={() => setIsLoaderOpen(false)}
+        onCancelLoad={handleCancelFileLoading}
         onAddTracksOnly={(s) => handleAddTracksOnly(s)}
         onLoadCustomGenome={(p) => handleLoadCustomGenome(p)}
         onSelectSacCer3={() => void handleSelectSacCer3()}
@@ -1577,6 +1771,65 @@ export default function App() {
           setBlastInitialQuery(qFasta);
           setIsBlastOpen(true);
         }}
+      />
+
+      <VariantAnnotationModal
+        isOpen={isAnnotationModalOpen}
+        isScanning={isScanning}
+        scanProgress={scanProgress}
+        variants={
+          scannedVariants.length > 0 ? scannedVariants : windowData?.analysis?.variants ?? []
+        }
+        scanScope={scannedVariants.length > 0 ? scanScope : 'current_chrom'}
+        currentChrom={chrom}
+        refContigs={workspace?.contigs ?? []}
+        s1Label={workspace?.strains[primaryIdx]?.label ?? 'Strain_1'}
+        s2Label={hasStrain2 && secondaryIdx !== null ? workspace?.strains[secondaryIdx]?.label ?? 'Strain_2' : null}
+        hasStrains={(workspace?.strains.length ?? 0) > 0}
+        onClose={() => setIsAnnotationModalOpen(false)}
+        onStartScan={(sc) => void handleStartScan(sc)}
+        onCancelScan={() => void handleCancelScan()}
+        onJumpToVariant={(vChrom, vStart, vEnd) => {
+          const pad = Math.max(80, Math.round((vEnd - vStart) * 1.5));
+          const targetLen =
+            workspace?.contigs.find((c) => c.name === vChrom)?.length ?? currentChromLength;
+          setIsAnnotationModalOpen(false);
+          void fetchWindow(
+            vChrom,
+            Math.max(0, vStart - pad),
+            Math.min(targetLen, vEnd + pad),
+          );
+        }}
+      />
+
+      <CnvSvModal
+        isOpen={isCnvModalOpen}
+        isRunning={isAnalyzingCnv}
+        progress={cnvProgress}
+        errorMsg={cnvError}
+        result={cnvResult}
+        strainLabels={workspace?.strains.map((s) => s.label) ?? []}
+        onClose={() => setIsCnvModalOpen(false)}
+        onStartAnalyze={(p) => void handleStartCnvSv(p)}
+        onCancelAnalyze={() => void handleCancelCnvSv()}
+        onJumpToRegion={(rChrom, rStart, rEnd) => {
+          const targetLen =
+            workspace?.contigs.find((c) => c.name === rChrom)?.length ?? currentChromLength;
+          const span = Math.max(200, rEnd - rStart);
+          const pad = Math.round(span * 0.25);
+          void fetchWindow(
+            rChrom,
+            Math.max(0, rStart - pad),
+            Math.min(targetLen, rEnd + pad),
+          );
+        }}
+      />
+
+      <FontSettingsModal
+        isOpen={isFontModalOpen}
+        settings={fontSettings}
+        onChangeSettings={handleChangeFontSettings}
+        onClose={() => setIsFontModalOpen(false)}
       />
     </div>
   );

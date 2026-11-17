@@ -10,6 +10,15 @@ import {
 } from '../bio/barcodeScanner';
 import { forEachCigarOp } from '../bio/cigar';
 import {
+  analyzeCnvAndLohForStrain,
+  annotateCrossStrainSvSpecificity,
+  clusterSvSignals,
+  measureProbeWindow,
+  type CnvSvAnalysisResult,
+  type ProbeBinMeasurement,
+  type StrainCnvSvProfile,
+} from '../bio/cnvSvAnalyzer';
+import {
   buildAnalysisFromCalls,
   buildThreeWayAnalysis,
   computeConsensusForRegion,
@@ -41,12 +50,15 @@ import {
   type BlastReferenceIndex,
 } from '../bio/localBlast';
 import { createBuiltInS288CAnnotationIndex } from '../bio/s288cBuiltIn';
-import { looksLikeYeastGenome } from '../bio/yeastAliases';
+import { annotateVariants } from '../bio/variantAnnotator';
+import { isMitochondrialChrom, looksLikeYeastGenome, normalizeYeastChromName } from '../bio/yeastAliases';
+import type { MainThreadBlobRelay } from '../utils/safeBlobReader';
 import type {
   AlignedRead,
   ConsensusOptions,
   ConsensusPositionCall,
   ContigInfo,
+  SvRawReadSignal,
   VariantRecord,
 } from '../bio/types';
 import type {
@@ -59,8 +71,10 @@ import type {
   BlastQueryResult,
   BlastRunPayload,
   BlastSearchResult,
+  CnvSvPayload,
   ExtractedExtraStrain,
   ExtractionResult,
+  StrainFileInput,
   StrainWindowData,
   TrackSummaryMeta,
   WindowQueryResult,
@@ -70,6 +84,7 @@ import type {
 } from './wgsProtocol';
 
 const DETAIL_MAX_SPAN = 30_000;
+const VIEWER_WINDOW_MAX_RECORDS = 8_000;
 const EXTRACT_CHUNK_BP = 20_000;
 const EXTRACT_MAX_RECORDS_PER_CHUNK = 200_000;
 const OVERVIEW_BINS = 480;
@@ -92,6 +107,38 @@ let isDemoMode = false;
 let activeScanToken = 0;
 let activeBlastToken = 0;
 let activeBarcodeToken = 0;
+let activeCnvToken = 0;
+let activeWindowAbort: AbortController | null = null;
+let nextRelayId = 1;
+const pendingRelays = new Map<
+  number,
+  { resolve: (bytes: Uint8Array) => void; reject: (err: Error) => void }
+>();
+
+function abortActiveWindow() {
+  if (activeWindowAbort) {
+    activeWindowAbort.abort();
+    activeWindowAbort = null;
+  }
+}
+
+function createBlobRelay(fileKey: string): MainThreadBlobRelay {
+  return (start: number, end: number) =>
+    new Promise<Uint8Array>((resolve, reject) => {
+      const relayId = nextRelayId++;
+      pendingRelays.set(relayId, { resolve, reject });
+      const msg: WorkerResponse = { type: 'read_blob_slice', relayId, fileKey, start, end };
+      self.postMessage(msg);
+    });
+}
+
+function makeGmodBamSource(st: StrainFileInput): GmodBamSource {
+  return new GmodBamSource(st.id, st.label, st.bamFile, st.indexFile, {
+    onStatus: (message) => reportLoadProgress(message),
+    mainThreadBamRelay: createBlobRelay(`${st.id}:bam`),
+    mainThreadIndexRelay: createBlobRelay(`${st.id}:bai`),
+  });
+}
 
 function getBuiltInAnnotation(): AnnotationIndex {
   if (!cachedBuiltInAnnotation) {
@@ -106,8 +153,11 @@ function replyOk(reqId: number, data: unknown) {
 }
 
 function replyErr(reqId: number, err: unknown) {
+  const aborted = Boolean(err && typeof err === 'object' && (err as { name?: string }).name === 'AbortError');
   const message = err instanceof Error ? err.message : String(err);
-  const msg: WorkerResponse = { reqId, ok: false, error: message };
+  const msg: WorkerResponse = aborted
+    ? { reqId, ok: false, error: message || '작업이 취소되었습니다.', aborted: true }
+    : { reqId, ok: false, error: message };
   self.postMessage(msg);
 }
 
@@ -190,44 +240,53 @@ async function handleQueryAllChroms(
   contigOverrides?: Record<string, Record<string, string>>,
 ): Promise<AllChromsOverviewResult> {
   if (!refSource) throw new Error('레퍼런스가 로드되지 않았습니다.');
+  abortActiveWindow();
+  const ctrl = new AbortController();
+  activeWindowAbort = ctrl;
   const contigs = refSource.getContigs();
 
-  const strains: AllChromsOverviewResult['strains'] = [];
-  for (let i = 0; i < strainSources.length; i++) {
-    const s = strainSources[i];
-    reportLoadProgress(
-      `'${s.label}' 전체 염색체 커버리지 계산 중 (${i + 1}/${strainSources.length})...`,
-    );
-    const byChrom: AllChromsOverviewResult['strains'][number]['byChrom'] = [];
-    for (const c of contigs) {
-      const matchedChrom = await resolveContigForStrain(s, c.name, c.length, contigOverrides);
-      if (!matchedChrom) {
+  try {
+    const strains: AllChromsOverviewResult['strains'] = [];
+    for (let i = 0; i < strainSources.length; i++) {
+      ctrl.signal.throwIfAborted();
+      const s = strainSources[i];
+      reportLoadProgress(
+        `'${s.label}' 전체 염색체 커버리지 계산 중 (${i + 1}/${strainSources.length})...`,
+      );
+      const byChrom: AllChromsOverviewResult['strains'][number]['byChrom'] = [];
+      for (const c of contigs) {
+        ctrl.signal.throwIfAborted();
+        const matchedChrom = await resolveContigForStrain(s, c.name, c.length, contigOverrides);
+        if (!matchedChrom) {
+          byChrom.push({
+            chrom: c.name,
+            matchedChrom: null,
+            bins: new Array<number>(24).fill(0),
+            meanDepth: 0,
+          });
+          continue;
+        }
+        const numBins = Math.max(12, Math.min(80, Math.round(c.length / 20_000)));
+        const bins = await s.getOverviewCoverage(matchedChrom, 0, c.length, numBins);
+        const meanDepth = bins.reduce((a, b) => a + b, 0) / Math.max(1, bins.length);
         byChrom.push({
           chrom: c.name,
-          matchedChrom: null,
-          bins: new Array<number>(24).fill(0),
-          meanDepth: 0,
+          matchedChrom,
+          bins,
+          meanDepth,
         });
-        continue;
       }
-      const numBins = Math.max(12, Math.min(80, Math.round(c.length / 20_000)));
-      const bins = await s.getOverviewCoverage(matchedChrom, 0, c.length, numBins);
-      const meanDepth = bins.reduce((a, b) => a + b, 0) / Math.max(1, bins.length);
-      byChrom.push({
-        chrom: c.name,
-        matchedChrom,
-        bins,
-        meanDepth,
+      strains.push({
+        id: s.id,
+        label: s.label,
+        byChrom,
       });
     }
-    strains.push({
-      id: s.id,
-      label: s.label,
-      byChrom,
-    });
-  }
 
-  return { contigs, strains };
+    return { contigs, strains };
+  } finally {
+    if (activeWindowAbort === ctrl) activeWindowAbort = null;
+  }
 }
 
 async function handleQueryWindow(payload: {
@@ -244,25 +303,32 @@ async function handleQueryWindow(payload: {
     throw new Error('레퍼런스 FASTA가 아직 로드되지 않았습니다.');
   }
 
-  const contigs = refSource.getContigs();
-  const contig = findTargetContig(contigs, payload.chrom);
-  if (!contig) {
-    throw new Error('레퍼런스에 유효한 염색체/컨티그가 없습니다.');
-  }
+  abortActiveWindow();
+  const ctrl = new AbortController();
+  activeWindowAbort = ctrl;
 
-  const start = Math.max(0, Math.floor(payload.start));
-  const end = Math.min(contig.length, Math.max(start + 1, Math.floor(payload.end)));
-  const span = end - start;
-  const effectiveSpan = Math.max(1, Math.floor(payload.viewSpan ?? span));
-  const isOverviewOnly = effectiveSpan > DETAIL_MAX_SPAN;
+  try {
+    const contigs = refSource.getContigs();
+    const contig = findTargetContig(contigs, payload.chrom);
+    if (!contig) {
+      throw new Error('레퍼런스에 유효한 염색체/컨티그가 없습니다.');
+    }
 
-  const features = annotationIndex
-    ? annotationIndex.getFeaturesInRange(contig.name, start, end)
-    : [];
+    const start = Math.max(0, Math.floor(payload.start));
+    const end = Math.min(contig.length, Math.max(start + 1, Math.floor(payload.end)));
+    const span = end - start;
+    const effectiveSpan = Math.max(1, Math.floor(payload.viewSpan ?? span));
+    const isOverviewOnly = effectiveSpan > DETAIL_MAX_SPAN;
 
-  if (isOverviewOnly) {
-    const strains: StrainWindowData[] = await Promise.all(
-      strainSources.map(async (s) => {
+    const features = annotationIndex
+      ? annotationIndex.getFeaturesInRange(contig.name, start, end)
+      : [];
+
+    if (isOverviewOnly) {
+      const strains: StrainWindowData[] = [];
+      for (let sIdx = 0; sIdx < strainSources.length; sIdx++) {
+        ctrl.signal.throwIfAborted();
+        const s = strainSources[sIdx];
         const matchedChrom = await resolveContigForStrain(
           s,
           contig.name,
@@ -270,15 +336,19 @@ async function handleQueryWindow(payload: {
           payload.contigOverrides,
         );
         if (!matchedChrom) {
-          return {
+          strains.push({
             id: s.id,
             label: s.label,
             matchedChrom: null,
             reads: [],
             overviewBins: new Array<number>(OVERVIEW_BINS).fill(0),
             meanDepth: 0,
-          };
+          });
+          continue;
         }
+        reportLoadProgress(
+          `'${s.label}' ${contig.name} 개요 커버리지 읽는 중 (${sIdx + 1}/${strainSources.length})...`,
+        );
         const overviewBins = await s.getOverviewCoverage(
           matchedChrom,
           start,
@@ -287,197 +357,226 @@ async function handleQueryWindow(payload: {
         );
         const meanDepth =
           overviewBins.reduce((a, b) => a + b, 0) / Math.max(1, overviewBins.length);
-        return {
+        strains.push({
           id: s.id,
           label: s.label,
           matchedChrom,
           reads: [],
           overviewBins,
           meanDepth,
-        };
-      }),
-    );
+        });
+      }
+
+      return {
+        chrom: contig.name,
+        start,
+        end,
+        isOverviewOnly: true,
+        refSeq: '',
+        features,
+        strains,
+        analysis: null,
+      };
+    }
+
+    const refSeq = await refSource.getSequence(contig.name, start, end);
+
+    // 다수 BAM 파일 동시 디스크/DLP I/O 및 WASM 힙 경합을 막기 위해 균주별로 순차 매핑
+    const rawStrainsData: Array<{
+      id: string;
+      label: string;
+      matchedChrom: string | null;
+      allReads: AlignedRead[];
+      packedReads: ReturnType<typeof packReadsWithHeap>['visiblePacked'];
+      totalRows: number;
+      overviewBins: number[];
+      meanDepth: number;
+    }> = [];
+
+    for (let sIdx = 0; sIdx < strainSources.length; sIdx++) {
+      ctrl.signal.throwIfAborted();
+      const s = strainSources[sIdx];
+      const matchedChrom = await resolveContigForStrain(
+        s,
+        contig.name,
+        contig.length,
+        payload.contigOverrides,
+      );
+      if (!matchedChrom) {
+        rawStrainsData.push({
+          id: s.id,
+          label: s.label,
+          matchedChrom: null,
+          allReads: [],
+          packedReads: [],
+          totalRows: 0,
+          overviewBins: new Array<number>(Math.min(OVERVIEW_BINS, span)).fill(0),
+          meanDepth: 0,
+        });
+        continue;
+      }
+
+      reportLoadProgress(
+        `'${s.label}' ${contig.name} 구간 리드 읽는 중 (${sIdx + 1}/${strainSources.length})...`,
+      );
+      let lastProgAt = 0;
+      const rawReads = await s.getRecords(matchedChrom, start, end, VIEWER_WINDOW_MAX_RECORDS, {
+        includeQual: payload.options.minBaseQ > 0,
+        signal: ctrl.signal,
+        onProgress: (loadedBytes, totalBytes) => {
+          const now = performance.now();
+          if (now - lastProgAt >= 180 || loadedBytes >= totalBytes) {
+            lastProgAt = now;
+            const mbLoaded = (loadedBytes / (1024 * 1024)).toFixed(1);
+            const mbTotal = Math.max(0.1, totalBytes / (1024 * 1024)).toFixed(1);
+            reportLoadProgress(
+              `'${s.label}' ${contig.name} 청크 읽는 중 (${mbLoaded}/${mbTotal} MB)...`,
+            );
+          }
+        },
+      });
+      ctrl.signal.throwIfAborted();
+      const reads = rawReads.filter((r) => (r.flags & 0x704) === 0);
+      const numBins = Math.min(DETAIL_COV_BINS, span);
+      const overviewBins = new Array<number>(numBins).fill(0);
+      const binWidth = span / numBins;
+      let totalBases = 0;
+
+      const addCovSpan = (covStart: number, covEnd: number) => {
+        const ovStart = covStart > start ? covStart : start;
+        const ovEnd = covEnd < end ? covEnd : end;
+        if (ovEnd <= ovStart) return;
+        totalBases += ovEnd - ovStart;
+        const b0 = Math.max(0, Math.floor((ovStart - start) / binWidth));
+        const b1 = Math.min(numBins - 1, Math.floor((ovEnd - 1 - start) / binWidth));
+        for (let b = b0; b <= b1; b++) {
+          const bs = start + b * binWidth;
+          const be = start + (b + 1) * binWidth;
+          const segOv = (ovEnd < be ? ovEnd : be) - (ovStart > bs ? ovStart : bs);
+          if (segOv > 0) overviewBins[b] += segOv / binWidth;
+        }
+      };
+
+      for (const r of reads) {
+        if (r.mapq < payload.options.minMapQ) continue;
+        let refPos = r.start;
+        let sawOp = false;
+        forEachCigarOp(r.cigar, (op, len) => {
+          sawOp = true;
+          if (op === 'M' || op === '=' || op === 'X') {
+            addCovSpan(refPos, refPos + len);
+            refPos += len;
+          } else if (op === 'D' || op === 'N') {
+            refPos += len;
+          }
+        });
+        if (!sawOp) {
+          addCovSpan(r.start, r.end);
+        }
+      }
+
+      const packed = packReadsWithHeap(reads, MAX_VISIBLE_PILEUP_ROWS);
+
+      rawStrainsData.push({
+        id: s.id,
+        label: s.label,
+        matchedChrom,
+        allReads: reads,
+        packedReads: packed.visiblePacked,
+        totalRows: packed.totalRows,
+        overviewBins,
+        meanDepth: totalBases / Math.max(1, span),
+      });
+    }
+
+    const hasPrimary =
+      strainSources.length > 0 &&
+      payload.primaryStrainIndex >= 0 &&
+      payload.primaryStrainIndex < rawStrainsData.length;
+    const s1Reads: AlignedRead[] = hasPrimary
+      ? rawStrainsData[payload.primaryStrainIndex]?.allReads ?? []
+      : [];
+    const hasSecondary =
+      hasPrimary &&
+      payload.secondaryStrainIndex !== null &&
+      payload.secondaryStrainIndex >= 0 &&
+      payload.secondaryStrainIndex < rawStrainsData.length;
+    const s2Reads: AlignedRead[] | null = hasSecondary
+      ? rawStrainsData[payload.secondaryStrainIndex!]?.allReads ?? []
+      : null;
+
+    const analysis = hasPrimary
+      ? buildThreeWayAnalysis(
+          contig.name,
+          start,
+          end,
+          refSeq,
+          s1Reads,
+          s2Reads,
+          payload.options,
+          true,
+        )
+      : null;
+
+    if (analysis && analysis.variants.length > 0) {
+      analysis.variants = await annotateRegionVariants(
+        contig.name,
+        contig.length,
+        start,
+        refSeq,
+        analysis.variants,
+      );
+    }
+
+    const s1Ticks = analysis ? deriveAlleleTicksFromCalls(analysis.s1Calls) : undefined;
+    const s2Ticks =
+      analysis && analysis.hasStrain2 ? deriveAlleleTicksFromCalls(analysis.s2Calls) : undefined;
+
+    const strains: StrainWindowData[] = rawStrainsData.map((sd, idx) => {
+      let alleleTicks =
+        idx === payload.primaryStrainIndex
+          ? s1Ticks
+          : hasSecondary && idx === payload.secondaryStrainIndex
+            ? s2Ticks
+            : undefined;
+
+      if (!alleleTicks && sd.matchedChrom && sd.allReads.length > 0 && refSeq) {
+        const extraCalls = computeConsensusForRegion(
+          refSeq,
+          sd.allReads,
+          start,
+          end,
+          payload.options,
+        );
+        alleleTicks = deriveAlleleTicksFromCalls(extraCalls);
+      }
+
+      return {
+        id: sd.id,
+        label: sd.label,
+        matchedChrom: sd.matchedChrom,
+        reads: [], // 가시 행(28줄)만 packedReads로 전송해 워커-메인 스레드 직렬화 부하를 95%+ 절감
+        packedReads: sd.packedReads,
+        totalRows: sd.totalRows,
+        alleleTicks: alleleTicks ?? [],
+        overviewBins: sd.overviewBins,
+        meanDepth: sd.meanDepth,
+      };
+    });
 
     return {
       chrom: contig.name,
       start,
       end,
-      isOverviewOnly: true,
-      refSeq: '',
+      isOverviewOnly: false,
+      refSeq,
       features,
       strains,
-      analysis: null,
+      analysis,
     };
+  } finally {
+    if (activeWindowAbort === ctrl) activeWindowAbort = null;
   }
-
-  const refSeq = await refSource.getSequence(contig.name, start, end);
-
-  // 다수 BAM 파일 동시 디스크/DLP I/O 및 WASM 힙 경합을 막기 위해 균주별로 순차 매핑
-  const rawStrainsData: Array<{
-    id: string;
-    label: string;
-    matchedChrom: string | null;
-    allReads: AlignedRead[];
-    packedReads: ReturnType<typeof packReadsWithHeap>['visiblePacked'];
-    totalRows: number;
-    overviewBins: number[];
-    meanDepth: number;
-  }> = [];
-
-  for (let sIdx = 0; sIdx < strainSources.length; sIdx++) {
-    const s = strainSources[sIdx];
-    const matchedChrom = await resolveContigForStrain(
-      s,
-      contig.name,
-      contig.length,
-      payload.contigOverrides,
-    );
-    if (!matchedChrom) {
-      rawStrainsData.push({
-        id: s.id,
-        label: s.label,
-        matchedChrom: null,
-        allReads: [],
-        packedReads: [],
-        totalRows: 0,
-        overviewBins: new Array<number>(Math.min(OVERVIEW_BINS, span)).fill(0),
-        meanDepth: 0,
-      });
-      continue;
-    }
-
-    reportLoadProgress(
-      `'${s.label}' ${contig.name} 구간 리드 읽는 중 (${sIdx + 1}/${strainSources.length})...`,
-    );
-    const rawReads = await s.getRecords(matchedChrom, start, end);
-    const reads = rawReads.filter((r) => (r.flags & 0x704) === 0);
-    const numBins = Math.min(DETAIL_COV_BINS, span);
-    const overviewBins = new Array<number>(numBins).fill(0);
-    const binWidth = span / numBins;
-    let totalBases = 0;
-
-    const addCovSpan = (covStart: number, covEnd: number) => {
-      const ovStart = covStart > start ? covStart : start;
-      const ovEnd = covEnd < end ? covEnd : end;
-      if (ovEnd <= ovStart) return;
-      totalBases += ovEnd - ovStart;
-      const b0 = Math.max(0, Math.floor((ovStart - start) / binWidth));
-      const b1 = Math.min(numBins - 1, Math.floor((ovEnd - 1 - start) / binWidth));
-      for (let b = b0; b <= b1; b++) {
-        const bs = start + b * binWidth;
-        const be = start + (b + 1) * binWidth;
-        const segOv = (ovEnd < be ? ovEnd : be) - (ovStart > bs ? ovStart : bs);
-        if (segOv > 0) overviewBins[b] += segOv / binWidth;
-      }
-    };
-
-    for (const r of reads) {
-      if (r.mapq < payload.options.minMapQ) continue;
-      let refPos = r.start;
-      let sawOp = false;
-      forEachCigarOp(r.cigar, (op, len) => {
-        sawOp = true;
-        if (op === 'M' || op === '=' || op === 'X') {
-          addCovSpan(refPos, refPos + len);
-          refPos += len;
-        } else if (op === 'D' || op === 'N') {
-          refPos += len;
-        }
-      });
-      if (!sawOp) {
-        addCovSpan(r.start, r.end);
-      }
-    }
-
-    const packed = packReadsWithHeap(reads, MAX_VISIBLE_PILEUP_ROWS);
-
-    rawStrainsData.push({
-      id: s.id,
-      label: s.label,
-      matchedChrom,
-      allReads: reads,
-      packedReads: packed.visiblePacked,
-      totalRows: packed.totalRows,
-      overviewBins,
-      meanDepth: totalBases / Math.max(1, span),
-    });
-  }
-
-  const hasPrimary =
-    strainSources.length > 0 &&
-    payload.primaryStrainIndex >= 0 &&
-    payload.primaryStrainIndex < rawStrainsData.length;
-  const s1Reads: AlignedRead[] = hasPrimary
-    ? rawStrainsData[payload.primaryStrainIndex]?.allReads ?? []
-    : [];
-  const hasSecondary =
-    hasPrimary &&
-    payload.secondaryStrainIndex !== null &&
-    payload.secondaryStrainIndex >= 0 &&
-    payload.secondaryStrainIndex < rawStrainsData.length;
-  const s2Reads: AlignedRead[] | null = hasSecondary
-    ? rawStrainsData[payload.secondaryStrainIndex!]?.allReads ?? []
-    : null;
-
-  const analysis = hasPrimary
-    ? buildThreeWayAnalysis(
-        contig.name,
-        start,
-        end,
-        refSeq,
-        s1Reads,
-        s2Reads,
-        payload.options,
-        true,
-      )
-    : null;
-
-  const s1Ticks = analysis ? deriveAlleleTicksFromCalls(analysis.s1Calls) : undefined;
-  const s2Ticks =
-    analysis && analysis.hasStrain2 ? deriveAlleleTicksFromCalls(analysis.s2Calls) : undefined;
-
-  const strains: StrainWindowData[] = rawStrainsData.map((sd, idx) => {
-    let alleleTicks =
-      idx === payload.primaryStrainIndex
-        ? s1Ticks
-        : hasSecondary && idx === payload.secondaryStrainIndex
-          ? s2Ticks
-          : undefined;
-
-    if (!alleleTicks && sd.matchedChrom && sd.allReads.length > 0 && refSeq) {
-      const extraCalls = computeConsensusForRegion(
-        refSeq,
-        sd.allReads,
-        start,
-        end,
-        payload.options,
-      );
-      alleleTicks = deriveAlleleTicksFromCalls(extraCalls);
-    }
-
-    return {
-      id: sd.id,
-      label: sd.label,
-      matchedChrom: sd.matchedChrom,
-      reads: [], // 가시 행(28줄)만 packedReads로 전송해 워커-메인 스레드 직렬화 부하를 95%+ 절감
-      packedReads: sd.packedReads,
-      totalRows: sd.totalRows,
-      alleleTicks: alleleTicks ?? [],
-      overviewBins: sd.overviewBins,
-      meanDepth: sd.meanDepth,
-    };
-  });
-
-  return {
-    chrom: contig.name,
-    start,
-    end,
-    isOverviewOnly: false,
-    refSeq,
-    features,
-    strains,
-    analysis,
-  };
 }
 
 async function handleExtractRegion(payload: {
@@ -613,7 +712,66 @@ async function handleExtractRegion(payload: {
   };
 }
 
+async function annotateRegionVariants(
+  chrom: string,
+  contigLength: number,
+  winStart: number,
+  winRefSeq: string,
+  variants: VariantRecord[],
+): Promise<VariantRecord[]> {
+  if (variants.length === 0 || !refSource) return variants;
+  const winEnd = winStart + winRefSeq.length;
+  const extraSlices: Array<{ start: number; seq: string }> = [];
+
+  // 청크 경계를 걸치는 유전자 코돈/스플라이스/VCF 앵커가 있을 때만 경계 인접 구간 추가 조회
+  const needLeft = variants.some((v) => v.start <= winStart + 3) && winStart > 0;
+  const needRight = variants.some((v) => v.end >= winEnd - 3) && winEnd < contigLength;
+  if (needLeft) {
+    const ls = Math.max(0, winStart - 200);
+    extraSlices.push({ start: ls, seq: await refSource.getSequence(chrom, ls, winStart) });
+  }
+  if (needRight) {
+    const re = Math.min(contigLength, winEnd + 200);
+    extraSlices.push({ start: winEnd, seq: await refSource.getSequence(chrom, winEnd, re) });
+  }
+
+  // 경계를 걸치는 다중엑손 유전자가 있으면 해당 유전자 전체 CDS 커버 범위 보강
+  if (annotationIndex) {
+    const boundaryRanges: Array<{ s: number; e: number }> = [];
+    for (const v of variants) {
+      if (v.start - winStart < 200 || winEnd - v.end < 200) {
+        for (const f of annotationIndex.getFeaturesInRange(chrom, v.start, v.end)) {
+          if (f.start < winStart || f.end > winEnd) {
+            boundaryRanges.push({ s: Math.max(0, f.start - 4), e: Math.min(contigLength, f.end + 4) });
+          }
+        }
+      }
+    }
+    for (const br of boundaryRanges) {
+      if (extraSlices.some((x) => x.start <= br.s && x.start + x.seq.length >= br.e)) continue;
+      if (br.e - br.s <= 30_000) {
+        extraSlices.push({ start: br.s, seq: await refSource.getSequence(chrom, br.s, br.e) });
+      }
+    }
+  }
+
+  const getRefBase = (qChrom: string, pos: number): string => {
+    if (qChrom === chrom && pos >= winStart && pos < winEnd) {
+      return winRefSeq[pos - winStart] ?? 'N';
+    }
+    for (const ex of extraSlices) {
+      if (pos >= ex.start && pos < ex.start + ex.seq.length) {
+        return ex.seq[pos - ex.start] ?? 'N';
+      }
+    }
+    return 'N';
+  };
+
+  return annotateVariants(variants, annotationIndex, getRefBase);
+}
+
 async function handleScanChromosome(payload: {
+  scope?: 'current_chrom' | 'all_chroms';
   chrom: string;
   primaryStrainIndex: number;
   secondaryStrainIndex: number | null;
@@ -622,8 +780,17 @@ async function handleScanChromosome(payload: {
 }): Promise<VariantRecord[]> {
   if (!refSource) throw new Error('레퍼런스가 로드되지 않았습니다.');
   if (strainSources.length === 0) return [];
-  const contig = findTargetContig(refSource.getContigs(), payload.chrom);
-  if (!contig) throw new Error(`염색체 ${payload.chrom}를 찾을 수 없습니다.`);
+
+  const allContigs = refSource.getContigs();
+  const scope = payload.scope ?? 'current_chrom';
+  const targetContigs =
+    scope === 'all_chroms'
+      ? allContigs
+      : (() => {
+          const single = findTargetContig(allContigs, payload.chrom);
+          if (!single) throw new Error(`염색체 ${payload.chrom}를 찾을 수 없습니다.`);
+          return [single];
+        })();
 
   const token = ++activeScanToken;
   const s1 = strainSources[payload.primaryStrainIndex];
@@ -633,46 +800,72 @@ async function handleScanChromosome(payload: {
     payload.secondaryStrainIndex < strainSources.length;
   const s2 = hasSecondary ? strainSources[payload.secondaryStrainIndex!] : undefined;
 
-  const s1Chrom = s1
-    ? await resolveContigForStrain(s1, contig.name, contig.length, payload.contigOverrides)
-    : null;
-  const s2Chrom = s2
-    ? await resolveContigForStrain(s2, contig.name, contig.length, payload.contigOverrides)
-    : null;
-
+  const totalGenomeBp = Math.max(
+    1,
+    targetContigs.reduce((acc, c) => acc + c.length, 0),
+  );
+  let scannedCumulativeBp = 0;
   const allVariants: VariantRecord[] = [];
 
-  for (let start = 0; start < contig.length; start += SCAN_CHUNK_BP) {
-    if (token !== activeScanToken) {
-      throw new Error('염색체 스캔이 취소되었습니다.');
+  for (let cIdx = 0; cIdx < targetContigs.length; cIdx++) {
+    const contig = targetContigs[cIdx];
+    const s1Chrom = s1
+      ? await resolveContigForStrain(s1, contig.name, contig.length, payload.contigOverrides)
+      : null;
+    const s2Chrom = s2
+      ? await resolveContigForStrain(s2, contig.name, contig.length, payload.contigOverrides)
+      : null;
+
+    if (!s1Chrom && !s2Chrom) {
+      scannedCumulativeBp += contig.length;
+      continue;
     }
 
-    const end = Math.min(contig.length, start + SCAN_CHUNK_BP);
-    const [refSeq, s1Reads, s2Reads] = await Promise.all([
-      refSource.getSequence(contig.name, start, end),
-      s1 && s1Chrom ? s1.getRecords(s1Chrom, start, end) : Promise.resolve([]),
-      hasSecondary && s2 && s2Chrom ? s2.getRecords(s2Chrom, start, end) : Promise.resolve(null),
-    ]);
+    for (let start = 0; start < contig.length; start += SCAN_CHUNK_BP) {
+      if (token !== activeScanToken) {
+        throw new Error('염색체 스캔이 취소되었습니다.');
+      }
 
-    const analysis = buildThreeWayAnalysis(
-      contig.name,
-      start,
-      end,
-      refSeq,
-      s1Reads,
-      hasSecondary ? s2Reads ?? [] : null,
-      payload.options,
-    );
+      const end = Math.min(contig.length, start + SCAN_CHUNK_BP);
+      const [refSeq, s1Reads, s2Reads] = await Promise.all([
+        refSource.getSequence(contig.name, start, end),
+        s1 && s1Chrom ? s1.getRecords(s1Chrom, start, end) : Promise.resolve([]),
+        hasSecondary && s2 && s2Chrom ? s2.getRecords(s2Chrom, start, end) : Promise.resolve(null),
+      ]);
 
-    allVariants.push(...analysis.variants);
+      const analysis = buildThreeWayAnalysis(
+        contig.name,
+        start,
+        end,
+        refSeq,
+        s1Reads,
+        hasSecondary ? s2Reads ?? [] : null,
+        payload.options,
+      );
 
-    self.postMessage({
-      type: 'scan_progress',
-      chrom: contig.name,
-      scannedBp: end,
-      totalBp: contig.length,
-      variantsSoFar: allVariants.length,
-    } satisfies WorkerResponse);
+      if (analysis.variants.length > 0) {
+        const annotated = await annotateRegionVariants(
+          contig.name,
+          contig.length,
+          start,
+          refSeq,
+          analysis.variants,
+        );
+        allVariants.push(...annotated);
+      }
+
+      self.postMessage({
+        type: 'scan_progress',
+        chrom: contig.name,
+        scannedBp: scannedCumulativeBp + end,
+        totalBp: totalGenomeBp,
+        variantsSoFar: allVariants.length,
+        chromIndex: cIdx + 1,
+        totalChroms: targetContigs.length,
+      } satisfies WorkerResponse);
+    }
+
+    scannedCumulativeBp += contig.length;
   }
 
   return allVariants;
@@ -1178,11 +1371,207 @@ async function handleScanBarcodes(payload: BarcodeScanPayload): Promise<BarcodeS
   };
 }
 
+function reportCnvProgress(message: string, percent: number) {
+  const ev: WorkerResponse = { type: 'cnv_progress', message, percent };
+  self.postMessage(ev);
+}
+
+async function handleAnalyzeCnvSv(payload: CnvSvPayload): Promise<CnvSvAnalysisResult> {
+  if (!refSource) throw new Error('레퍼런스 지놈이 로드되지 않았습니다.');
+  if (strainSources.length === 0) {
+    throw new Error('먼저 BAM + BAI 파일을 1개 이상 불러와주세요.');
+  }
+
+  const t0 = performance.now();
+  const token = ++activeCnvToken;
+  const contigs = refSource.getContigs();
+
+  const targetIndices =
+    payload.targetStrainIndex !== undefined &&
+    payload.targetStrainIndex !== null &&
+    payload.targetStrainIndex >= 0 &&
+    payload.targetStrainIndex < strainSources.length
+      ? [payload.targetStrainIndex]
+      : strainSources.map((_, i) => i);
+
+  // 각 염색체 빈 계획 (핵 염색체 10 kb, chrM 2 kb 간격; 각 빈에서 600 bp 정밀 프로브 측정)
+  const PROBE_BP = 600;
+  interface BinPlan {
+    chrom: string;
+    binStart: number;
+    binEnd: number;
+    probeStart: number;
+    probeEnd: number;
+  }
+  const binPlans: BinPlan[] = [];
+  for (const c of contigs) {
+    const step = isMitochondrialChrom(c.name) ? 2_000 : 10_000;
+    for (let s = 0; s < c.length; s += step) {
+      const e = Math.min(c.length, s + step);
+      const mid = s + Math.floor((e - s) / 2);
+      const pStart = Math.max(s, mid - Math.floor(PROBE_BP / 2));
+      const pEnd = Math.min(e, pStart + PROBE_BP);
+      if (pEnd > pStart) {
+        binPlans.push({ chrom: c.name, binStart: s, binEnd: e, probeStart: pStart, probeEnd: pEnd });
+      }
+    }
+  }
+
+  const probeRefCache = new Map<string, string>();
+  const lookupGenes = (qChrom: string, s: number, e: number) =>
+    annotationIndex ? annotationIndex.getFeaturesInRange(qChrom, s, e) : [];
+  const resolveCanonical = (bamChr: string): string => {
+    if (refSource) {
+      const resolved = refSource.resolveContigName(bamChr);
+      if (resolved) return resolved;
+    }
+    return normalizeYeastChromName(bamChr);
+  };
+
+  const svChunkBp = payload.scanMode === 'deep_sv' ? 50_000 : 0;
+  const profiles: StrainCnvSvProfile[] = [];
+  const totalUnits = Math.max(1, targetIndices.length * (binPlans.length + (svChunkBp > 0 ? contigs.length : 0)));
+  let doneUnits = 0;
+
+  for (let ti = 0; ti < targetIndices.length; ti++) {
+    const sIdx = targetIndices[ti];
+    const strain = strainSources[sIdx];
+    const matchedByRef: Record<string, string | null> = {};
+    for (const c of contigs) {
+      matchedByRef[c.name] = await resolveContigForStrain(
+        strain,
+        c.name,
+        c.length,
+        payload.contigOverrides,
+      );
+    }
+
+    const measurements: ProbeBinMeasurement[] = [];
+    const rawSvSignals: SvRawReadSignal[] = [];
+
+    for (let bi = 0; bi < binPlans.length; bi++) {
+      if (token !== activeCnvToken) throw new Error('CNV · 전좌 분석이 취소되었습니다.');
+      doneUnits++;
+      if (bi % 40 === 0) {
+        reportCnvProgress(
+          `'${strain.label}' CNV·BAF 프로파일 측정 중 (${bi + 1}/${binPlans.length} 구간)...`,
+          Math.min(92, Math.round((doneUnits / totalUnits) * 90)),
+        );
+      }
+
+      const plan = binPlans[bi];
+      const matchedChr = matchedByRef[plan.chrom];
+      if (!matchedChr) continue;
+
+      const cacheKey = `${plan.chrom}:${plan.probeStart}:${plan.probeEnd}`;
+      let refSeq = probeRefCache.get(cacheKey);
+      if (refSeq === undefined) {
+        refSeq = (await refSource.getSequence(plan.chrom, plan.probeStart, plan.probeEnd)).toUpperCase();
+        probeRefCache.set(cacheKey, refSeq);
+      }
+
+      const reads = await strain.getRecords(matchedChr, plan.probeStart, plan.probeEnd, 15_000);
+      measurements.push(
+        measureProbeWindow(
+          plan.chrom,
+          plan.binStart,
+          plan.binEnd,
+          plan.probeStart,
+          plan.probeEnd,
+          refSeq,
+          reads,
+          10,
+        ),
+      );
+
+      if (payload.scanMode === 'fast_sample' && strain.getSvSignals) {
+        const svS = Math.max(plan.binStart, plan.probeStart - 300);
+        const svE = Math.min(plan.binEnd, plan.probeEnd + 300);
+        const sigs = await strain.getSvSignals(matchedChr, svS, svE, 2_000);
+        for (const sg of sigs) rawSvSignals.push(sg);
+      }
+    }
+
+    if (payload.scanMode === 'deep_sv' && strain.getSvSignals) {
+      for (let ci = 0; ci < contigs.length; ci++) {
+        if (token !== activeCnvToken) throw new Error('CNV · 전좌 분석이 취소되었습니다.');
+        const c = contigs[ci];
+        doneUnits++;
+        reportCnvProgress(
+          `'${strain.label}' ${c.name} 전좌·구조변이(SV) 정밀 탐색 중...`,
+          Math.min(97, Math.round((doneUnits / totalUnits) * 95)),
+        );
+        const matchedChr = matchedByRef[c.name];
+        if (!matchedChr) continue;
+        for (let s = 0; s < c.length; s += svChunkBp) {
+          if (token !== activeCnvToken) throw new Error('CNV · 전좌 분석이 취소되었습니다.');
+          const e = Math.min(c.length, s + svChunkBp);
+          const sigs = await strain.getSvSignals(matchedChr, s, e, 25_000);
+          for (const sg of sigs) rawSvSignals.push(sg);
+        }
+      }
+    }
+
+    const baseProfile = analyzeCnvAndLohForStrain(
+      strain.id,
+      strain.label,
+      contigs,
+      matchedByRef,
+      measurements,
+      payload.ploidyPreference,
+      lookupGenes,
+    );
+    const svEvents = clusterSvSignals(
+      strain.id,
+      strain.label,
+      rawSvSignals,
+      resolveCanonical,
+      lookupGenes,
+      {
+        minSupport: payload.minSvSupport ?? 4,
+        excludeRdnaSelf: payload.excludeRdnaSv ?? true,
+      },
+    );
+
+    profiles.push({
+      ...baseProfile,
+      svEvents,
+    });
+  }
+
+  const annotatedProfiles = annotateCrossStrainSvSpecificity(profiles);
+  reportCnvProgress('CNV · LOH · SV 분석 완료', 100);
+
+  return {
+    scanMode: payload.scanMode,
+    ploidyPreference: payload.ploidyPreference,
+    elapsedMs: Math.round(performance.now() - t0),
+    contigs,
+    strains: annotatedProfiles,
+  };
+}
+
 self.onmessage = async (ev: MessageEvent<WorkerRequest>) => {
   const msg = ev.data;
+  if (!('action' in msg)) {
+    if (msg.type === 'read_blob_reply') {
+      const pending = pendingRelays.get(msg.relayId);
+      if (pending) {
+        pendingRelays.delete(msg.relayId);
+        if (msg.ok && msg.buffer) {
+          pending.resolve(new Uint8Array(msg.buffer));
+        } else {
+          pending.reject(new Error(msg.error || 'Main-thread blob relay failed'));
+        }
+      }
+    }
+    return;
+  }
+
   try {
     switch (msg.action) {
       case 'load_saccer3': {
+        abortActiveWindow();
         const url = msg.payload?.sacCer3Url ?? '/genomes/sacCer3.fa.gz';
         if (!cachedSacCer3Ref) {
           cachedSacCer3Ref = await MemoryFastaSource.fromGzipUrl(
@@ -1206,6 +1595,7 @@ self.onmessage = async (ev: MessageEvent<WorkerRequest>) => {
       }
 
       case 'load_demo': {
+        abortActiveWindow();
         const demo = createYeastDemoDataset();
         genomeId = 'demo';
         refSource = demo.reference;
@@ -1222,15 +1612,24 @@ self.onmessage = async (ev: MessageEvent<WorkerRequest>) => {
       }
 
       case 'load_files': {
+        abortActiveWindow();
         const { fastaFile, faiFile, gffFile, strains: strainInputs } = msg.payload;
         genomeId = 'custom';
-        refSource = await IndexedFastaSource.fromFiles(fastaFile, faiFile);
-        strainSources = strainInputs.map(
-          (st) => new GmodBamSource(st.id, st.label, st.bamFile, st.indexFile),
-        );
+        let lastFastaProg = 0;
+        refSource = await IndexedFastaSource.fromFiles(fastaFile, faiFile, (loaded, total) => {
+          const now = performance.now();
+          if (now - lastFastaProg >= 180 || loaded >= total) {
+            lastFastaProg = now;
+            reportLoadProgress(
+              `FASTA 인덱스 생성 중 (${(loaded / (1024 * 1024)).toFixed(1)}/${(total / (1024 * 1024)).toFixed(1)} MB)...`,
+            );
+          }
+        });
+        strainSources = strainInputs.map((st) => makeGmodBamSource(st));
 
         const contigs = refSource.getContigs();
         if (gffFile) {
+          reportLoadProgress('GFF3 유전자 주석 파싱 중...');
           annotationIndex = new AnnotationIndex(await parseGff3File(gffFile));
           annotationOrigin = 'user_gff';
         } else if (looksLikeYeastGenome(contigs)) {
@@ -1252,10 +1651,9 @@ self.onmessage = async (ev: MessageEvent<WorkerRequest>) => {
       }
 
       case 'add_strains': {
+        abortActiveWindow();
         if (!refSource) throw new Error('먼저 Reference 지놈을 불러와주세요.');
-        const newSources = msg.payload.strains.map(
-          (st) => new GmodBamSource(st.id, st.label, st.bamFile, st.indexFile),
-        );
+        const newSources = msg.payload.strains.map((st) => makeGmodBamSource(st));
         if (isDemoMode) {
           // 데모 트랙 대신 실제 사용자 트랙으로 전환 (Reference는 sacCer3로 자동 전환)
           if (cachedSacCer3Ref) {
@@ -1278,9 +1676,16 @@ self.onmessage = async (ev: MessageEvent<WorkerRequest>) => {
       }
 
       case 'remove_strain': {
+        abortActiveWindow();
         strainSources = strainSources.filter((s) => s.id !== msg.payload.id);
         const curChrom = msg.payload.currentChrom || refSource?.getContigs()[0]?.name || '';
         replyOk(msg.reqId, await makeWorkspaceSummary(curChrom, 0, 2_500));
+        break;
+      }
+
+      case 'cancel_window': {
+        abortActiveWindow();
+        replyOk(msg.reqId, true);
         break;
       }
 
@@ -1340,6 +1745,17 @@ self.onmessage = async (ev: MessageEvent<WorkerRequest>) => {
 
       case 'cancel_barcode_scan': {
         activeBarcodeToken++;
+        replyOk(msg.reqId, true);
+        break;
+      }
+
+      case 'analyze_cnv_sv': {
+        replyOk(msg.reqId, await handleAnalyzeCnvSv(msg.payload));
+        break;
+      }
+
+      case 'cancel_cnv_sv': {
+        activeCnvToken++;
         replyOk(msg.reqId, true);
         break;
       }

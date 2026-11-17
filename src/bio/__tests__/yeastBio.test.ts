@@ -42,9 +42,27 @@ import {
   sortYeastContigs,
   YEAST_CHROMOSOMES,
 } from '../yeastAliases';
+import {
+  analyzeCnvAndLohForStrain,
+  annotateCrossStrainSvSpecificity,
+  clusterSvSignals,
+  estimatePloidyFromBafs,
+  exportCnvSvToBed,
+  exportCnvSvToTsv,
+  measureProbeWindow,
+  type ProbeBinMeasurement,
+} from '../cnvSvAnalyzer';
 import { createBuiltInS288CAnnotationIndex } from '../s288cBuiltIn';
+import {
+  annotateVariants,
+  exportVariantsToTsv,
+  exportVariantsToVcf,
+  summarizeVariantsByGene,
+} from '../variantAnnotator';
 import { matchDroppedFiles } from '../../utils/fileMatcher';
-import { DEFAULT_CONSENSUS_OPTIONS, type AlignedRead } from '../types';
+import { readBlobRangeInChunks, readBlobSliceSafe } from '../../utils/safeBlobReader';
+import { GmodBamSource, SerializedCachedBlobFile } from '../bamSource';
+import { DEFAULT_CONSENSUS_OPTIONS, type AlignedRead, type VariantRecord } from '../types';
 
 describe('yeastAliases', () => {
   it('normalizes roman, arabic, and RefSeq chromosome names', () => {
@@ -1211,5 +1229,669 @@ describe('barcodeScanner (Standard YKO/Cre Barcodes & De Novo Blind Watermarks)'
     expect(cands).toHaveLength(1);
     expect(cands[0].signalType).toBe('paired_insertion');
     expect(cands[0].assembledSeq).toBe(bc9);
+  });
+});
+
+describe('variantAnnotator (SnpEff-style Functional Annotation & VCF/TSV)', () => {
+  it('annotates plus/minus strand multi-exon CDS, IUPAC het, chrM Table 3, splice, and promoter variants', () => {
+    // Gene + strand on chrV: 100..112 -> ATG ACT CAA TTA (M T Q L)
+    // Minus strand multi-exon gene on chrV: exon1 300..304 (T CAT -> complement ATG A), intron 304..320, exon2 320..326 (complement CAA TTT -> M K L...)
+    // Actually keep exact minus-strand sequence easy to read backwards:
+    // exon2 [320..326): genomic "GTACAT" -> RC = "ATGTAC" -> M Y (6 bp)
+    // intron [306..320): 14 bp
+    // exon1 [300..306): genomic "GTTTGA" -> RC = "TCAAAC" -> S N (6 bp)
+    // Total 12 bp coding: ATG TAC TCA AAC = M Y S N
+    // ChrM gene [50..62): ATG TGG ATA TTT -> M W(TGG) M(ATA in Table 3) F
+    const chrVSeq = new Array<string>(400).fill('A');
+    const setSlice = (pos: number, s: string) => {
+      for (let i = 0; i < s.length; i++) chrVSeq[pos + i] = s[i];
+    };
+    // Promoter test base at 70, coding + strand ATG ACT CAA TTA at 100..112
+    setSlice(100, 'ATGACTCAATTA');
+    // Minus strand multi-exon
+    setSlice(300, 'GTTTGA'); // genomic 300..306
+    setSlice(320, 'GTACAT'); // genomic 320..326
+
+    const chrMSeq = 'A'.repeat(50) + 'ATGTGGATATTT' + 'A'.repeat(40);
+
+    const idx = new AnnotationIndex([
+      {
+        id: 'GENE_PLUS',
+        name: 'TESTP',
+        systematicName: 'YEL001C',
+        chrom: 'chrV',
+        type: 'gene',
+        start: 100,
+        end: 112,
+        strand: '+',
+        subFeatures: [{ type: 'CDS', start: 100, end: 112 }],
+      },
+      {
+        id: 'GENE_MINUS',
+        name: 'ACTX',
+        systematicName: 'YEL002W',
+        chrom: 'chrV',
+        type: 'gene',
+        start: 300,
+        end: 326,
+        strand: '-',
+        subFeatures: [
+          { type: 'CDS', start: 300, end: 306 },
+          { type: 'CDS', start: 320, end: 326 },
+        ],
+      },
+      {
+        id: 'GENE_MITO',
+        name: 'COX_T',
+        chrom: 'chrM',
+        type: 'gene',
+        start: 50,
+        end: 62,
+        strand: '+',
+        subFeatures: [{ type: 'CDS', start: 50, end: 62 }],
+      },
+    ]);
+
+    const getRef = (chrom: string, pos: number) =>
+      chrom === 'chrM' ? chrMSeq[pos] ?? 'N' : chrVSeq[pos] ?? 'N';
+
+    const rawVars: VariantRecord[] = [
+      // 1. Missense ACT -> ATT (T2I)
+      {
+        chrom: 'chrV',
+        start: 104,
+        end: 105,
+        type: 'SNP',
+        category: 'strain1_only',
+        refAllele: 'C',
+        s1Allele: 'T',
+        s2Allele: 'C',
+        s1Depth: 30,
+        s2Depth: 30,
+      },
+      // 2. Het Nonsense CAA -> YAA (C/T -> Stop Q3*)
+      {
+        chrom: 'chrV',
+        start: 106,
+        end: 107,
+        type: 'SNP',
+        category: 'strain1_only',
+        refAllele: 'C',
+        s1Allele: 'Y',
+        s2Allele: 'C',
+        s1Depth: 40,
+        s2Depth: 40,
+      },
+      // 3. Minus-strand Exon2 Tyr TAC (320..323 = GTA -> RC TAC) mutated at genomic 321 (T->C => RC TAC -> TGC C => p.Y2C)
+      // Check genomic 320..323 = G T A. RC(320..323) = T A C. Base 322 is T(1st codon base A?), wait: 320=G,321=T,322=A,323=C,324=A,325=T.
+      // Codon 1 (cdsOffset 0..2): genomic 325(T->A), 324(A->T), 323(C->G) = ATG (M1).
+      // Codon 2 (cdsOffset 3..5): genomic 322(A->T), 321(T->A), 320(G->C) = TAC (Y2). Mutating genomic 321 T->C => coding pos1 = G -> TGC (Cys, Y2C)!
+      {
+        chrom: 'chrV',
+        start: 321,
+        end: 322,
+        type: 'SNP',
+        category: 'strain1_only',
+        refAllele: 'T',
+        s1Allele: 'C',
+        s2Allele: 'T',
+        s1Depth: 25,
+        s2Depth: 25,
+      },
+      // 4. Minus-strand splice site at 307 (1 bp adjacent to exon 300..306)
+      {
+        chrom: 'chrV',
+        start: 307,
+        end: 308,
+        type: 'SNP',
+        category: 'strain2_only',
+        refAllele: 'A',
+        s1Allele: 'A',
+        s2Allele: 'G',
+        s1Depth: 20,
+        s2Depth: 20,
+      },
+      // 5. Promoter -30 bp before + strand TESTP (pos 70)
+      {
+        chrom: 'chrV',
+        start: 70,
+        end: 71,
+        type: 'SNP',
+        category: 'shared',
+        refAllele: 'A',
+        s1Allele: 'G',
+        s2Allele: 'G',
+        s1Depth: 20,
+        s2Depth: 20,
+      },
+      // 6. Frameshift 2bp deletion inside TESTP
+      {
+        chrom: 'chrV',
+        start: 101,
+        end: 103,
+        type: 'DEL',
+        category: 'strain1_only',
+        refAllele: 'TG',
+        s1Allele: '--',
+        s2Allele: 'TG',
+        s1Depth: 22,
+        s2Depth: 22,
+      },
+      // 7. chrM Table 3: TGG (53..56, W2) -> TGA (55 G->A) is Trp (Synonymous) in Yeast Mitochondria, NOT Nonsense!
+      {
+        chrom: 'chrM',
+        start: 55,
+        end: 56,
+        type: 'SNP',
+        category: 'strain1_only',
+        refAllele: 'G',
+        s1Allele: 'A',
+        s2Allele: 'G',
+        s1Depth: 100,
+        s2Depth: 100,
+      },
+    ];
+
+    const annotated = annotateVariants(rawVars, idx, getRef);
+    expect(annotated[0].annotation?.impact).toBe('MODERATE');
+    expect(annotated[0].annotation?.hgvsP).toBe('p.T2I');
+
+    expect(annotated[1].annotation?.impact).toBe('HIGH');
+    expect(annotated[1].annotation?.consequence).toBe('nonsense');
+    expect(annotated[1].annotation?.isHeterozygous).toBe(true);
+    expect(annotated[1].annotation?.hgvsP).toContain('p.Q3*');
+
+    expect(annotated[2].annotation?.geneName).toBe('ACTX');
+    expect(annotated[2].annotation?.impact).toBe('MODERATE');
+    expect(annotated[2].annotation?.hgvsP).toBe('p.Y2C');
+
+    expect(annotated[3].annotation?.consequence).toBe('splice_site');
+    expect(annotated[3].annotation?.impact).toBe('HIGH');
+
+    expect(annotated[4].annotation?.consequence).toBe('promoter_500bp');
+    expect(annotated[4].annotation?.hgvsC).toBe('c.-30');
+
+    expect(annotated[5].annotation?.consequence).toBe('frameshift');
+    expect(annotated[5].annotation?.impact).toBe('HIGH');
+
+    expect(annotated[6].annotation?.impact).toBe('LOW');
+    expect(annotated[6].annotation?.consequence).toBe('synonymous');
+    expect(annotated[6].annotation?.hgvsP).toBe('p.W2=');
+
+    const summaries = summarizeVariantsByGene(annotated);
+    expect(summaries[0].geneName).toBe('TESTP');
+    expect(summaries[0].highCount).toBe(2);
+
+    const vcf = exportVariantsToVcf(
+      annotated,
+      [
+        { name: 'chrV', length: 400 },
+        { name: 'chrM', length: 102 },
+      ],
+      'Mutant',
+      'WT',
+    );
+    expect(vcf).toContain('##fileformat=VCFv4.2');
+    expect(vcf).toContain('chrV\t105\t.\tC\tT\t.\tPASS');
+    expect(vcf).toContain('0/1:40'); // het genotype in VCF
+    expect(vcf).toContain('chrV\t101\t.\tATG\tA\t'); // 1-bp upstream VCF DEL anchor normalization!
+
+    const tsv = exportVariantsToTsv(annotated, 'Mutant', 'WT');
+    expect(tsv).toContain('p.T2I');
+    expect(tsv).toContain('frameshift');
+  });
+});
+
+describe('cnvSvAnalyzer (Ploidy 1n/2n/4n, CNV Aneuploidy, BAF/LOH & Translocation SV)', () => {
+  it('auto-estimates 1n, 2n, and 4n ploidy accurately from BAF distributions', () => {
+    const haploid = estimatePloidyFromBafs([0.5], 100_000, 30);
+    expect(haploid.ploidy).toBe(1);
+
+    const diploidBafs = Array.from({ length: 60 }, (_, i) => 0.46 + (i % 5) * 0.02);
+    const diploid = estimatePloidyFromBafs(diploidBafs, 100_000, 30);
+    expect(diploid.ploidy).toBe(2);
+
+    const tetraploidBafs = Array.from({ length: 60 }, (_, i) =>
+      i % 3 === 0 ? 0.25 : i % 3 === 1 ? 0.75 : 0.5,
+    );
+    const tetraploid = estimatePloidyFromBafs(tetraploidBafs, 100_000, 40);
+    expect(tetraploid.ploidy).toBe(4);
+  });
+
+  it('detects 2n+1 trisomy, segmental deletion, CN-neutral LOH, Petite chrM, and 4n-1 monosomy', () => {
+    const contigs = [
+      { name: 'chrI', length: 60_000 },
+      { name: 'chrII', length: 60_000 },
+      { name: 'chrIII', length: 60_000 },
+      { name: 'chrVIII', length: 60_000 },
+      { name: 'chrM', length: 12_000 },
+    ];
+    const matched = {
+      chrI: 'chrI',
+      chrII: 'chrII',
+      chrIII: 'chrIII',
+      chrVIII: 'chrVIII',
+      chrM: 'chrM',
+    };
+
+    const measurements: ProbeBinMeasurement[] = [];
+    for (const c of contigs) {
+      const step = c.name === 'chrM' ? 2_000 : 10_000;
+      for (let s = 0; s < c.length; s += step) {
+        let depth = 30;
+        let het = 2;
+        let bafs = [0.48, 0.52];
+
+        if (c.name === 'chrVIII') {
+          depth = 45; // 3n trisomy in 2n wild strain
+        } else if (c.name === 'chrIII' && s >= 20_000 && s < 40_000) {
+          depth = 15; // 1n hemizygous segmental deletion (20 kb)
+        } else if (c.name === 'chrII' && s >= 10_000 && s < 50_000) {
+          het = 0; // 40 kb CN-neutral LOH (30x normal depth, 0 het sites)
+          bafs = [];
+        } else if (c.name === 'chrM') {
+          depth = 2; // Petite / rho-0 very low mtDNA relative to 30x nuclear
+          het = 0;
+          bafs = [];
+        }
+
+        measurements.push({
+          chrom: c.name,
+          start: s,
+          end: s + step,
+          probeStart: s,
+          probeEnd: s + 600,
+          rawDepth: depth,
+          sampledBp: 600,
+          hetSites: het,
+          bafs,
+        });
+      }
+    }
+
+    const idx = new AnnotationIndex([
+      {
+        id: 'LOH_GENE',
+        name: 'SUP45',
+        chrom: 'chrII',
+        type: 'gene',
+        start: 15_000,
+        end: 17_000,
+        strand: '+',
+        subFeatures: [],
+      },
+    ]);
+
+    const res2n = analyzeCnvAndLohForStrain(
+      'wild_2n',
+      'Wild_Diploid',
+      contigs,
+      matched,
+      measurements,
+      'auto',
+      (ch, s, e) => idx.getFeaturesInRange(ch, s, e),
+    );
+    expect(res2n.detectedPloidy).toBe(2);
+    expect(res2n.effectivePloidy).toBe(2);
+    expect(res2n.chromSummaries.find((x) => x.chrom === 'chrVIII')?.status).toBe('gain');
+    expect(res2n.chromSummaries.find((x) => x.chrom === 'chrVIII')?.estCopies).toBe(3);
+    expect(res2n.chromSummaries.find((x) => x.chrom === 'chrM')?.status).toBe('mitochondrial_low');
+    expect(res2n.cnvSegments.some((seg) => seg.chrom === 'chrIII' && seg.direction === 'deletion')).toBe(
+      true,
+    );
+    expect(res2n.lohSegments).toHaveLength(1);
+    expect(res2n.lohSegments[0].lohType).toBe('cn_neutral_loh');
+    expect(res2n.lohSegments[0].overlappingGenes).toContain('SUP45');
+
+    // Tetraploid 4n-1 single chromosome loss test (60x baseline vs 45x chrIII = 3.0 copies -> loss!)
+    const meas4n: ProbeBinMeasurement[] = contigs.slice(0, 4).flatMap((c) =>
+      Array.from({ length: 6 }, (_, k) => ({
+        chrom: c.name,
+        start: k * 10_000,
+        end: (k + 1) * 10_000,
+        probeStart: k * 10_000,
+        probeEnd: k * 10_000 + 600,
+        rawDepth: c.name === 'chrIII' ? 45 : 60,
+        sampledBp: 600,
+        hetSites: 2,
+        bafs: [0.25, 0.75],
+      })),
+    );
+    const res4n = analyzeCnvAndLohForStrain(
+      'wild_4n',
+      'Wild_Tetraploid',
+      contigs.slice(0, 4),
+      matched,
+      meas4n,
+      4,
+      () => [],
+    );
+    expect(res4n.effectivePloidy).toBe(4);
+    expect(res4n.chromSummaries.find((x) => x.chrom === 'chrIII')?.status).toBe('loss');
+    expect(res4n.chromSummaries.find((x) => x.chrom === 'chrIII')?.estCopies).toBe(3);
+  });
+
+  it('measures heterozygous BAF in probe windows and clusters translocation breakpoints from mate pairs + SA tags', () => {
+    const refSeq = 'ACGT'.repeat(50); // 200 bp
+    // 10 reads matching ref + 10 reads carrying SNP G at pos 10 (50% BAF)
+    const probeReads: AlignedRead[] = [
+      ...Array.from({ length: 10 }, (_, i) => ({
+        id: `ref_${i}`,
+        name: `ref_${i}`,
+        start: 0,
+        end: 40,
+        strand: '+' as const,
+        seq: refSeq.slice(0, 40),
+        cigar: '40M',
+        mapq: 60,
+        flags: 0,
+      })),
+      ...Array.from({ length: 10 }, (_, i) => ({
+        id: `alt_${i}`,
+        name: `alt_${i}`,
+        start: 0,
+        end: 40,
+        strand: '+' as const,
+        seq: refSeq.slice(0, 10) + 'A' + refSeq.slice(11, 40),
+        cigar: '40M',
+        mapq: 60,
+        flags: 0,
+      })),
+    ];
+    const m = measureProbeWindow('chrI', 0, 10000, 0, 40, refSeq.slice(0, 40), probeReads);
+    expect(m.rawDepth).toBe(20);
+    expect(m.hetSites).toBe(1);
+    expect(m.bafs[0]).toBeCloseTo(0.5, 2);
+
+    // Translocation chrIV:50,000 <-> chrVII:120,000 supported by 4 discordant pairs + 2 SA split reads
+    const svSignals = [
+      ...Array.from({ length: 4 }, (_, i) => ({
+        name: `tr_pair_${i}`,
+        chrom: 'chrIV',
+        start: 49_920 + i * 5,
+        end: 50_020 + i * 5,
+        strand: '+' as const,
+        mapq: 60,
+        isPaired: true,
+        mateChrom: 'chrVII',
+        matePos: 120_000 + i * 5,
+        mateStrand: '-' as const,
+        tlen: 0,
+        isSupplementary: false,
+      })),
+      ...Array.from({ length: 2 }, (_, i) => ({
+        name: `tr_split_${i}`,
+        chrom: 'chrIV',
+        start: 49_950,
+        end: 50_005,
+        strand: '+' as const,
+        mapq: 60,
+        isPaired: true,
+        mateChrom: 'chrIV',
+        matePos: 49_800,
+        mateStrand: '-' as const,
+        tlen: 200,
+        saTag: 'chrVII,120001,+,50S50M,60,0;',
+        isSupplementary: false,
+      })),
+      // rDNA self-translocation noise should be filtered
+      ...Array.from({ length: 6 }, (_, i) => ({
+        name: `rdna_noise_${i}`,
+        chrom: 'chrXII',
+        start: 458_000,
+        end: 458_100,
+        strand: '+' as const,
+        mapq: 60,
+        isPaired: true,
+        mateChrom: 'chrXII',
+        matePos: 467_000,
+        mateStrand: '-' as const,
+        tlen: 9_000,
+        isSupplementary: false,
+      })),
+    ];
+
+    const svs = clusterSvSignals(
+      'mut',
+      'Mutant',
+      svSignals,
+      (c) => c,
+      () => [],
+      { minSupport: 4, excludeRdnaSelf: true },
+    );
+    expect(svs).toHaveLength(1);
+    expect(svs[0].svType).toBe('TRANSLOCATION');
+    expect(svs[0].chrom1).toBe('chrIV');
+    expect(svs[0].chrom2).toBe('chrVII');
+    expect(svs[0].evidence).toBe('both');
+    expect(svs[0].supportPairs).toBe(4);
+    expect(svs[0].splitReads).toBe(2);
+
+    const mockProfiles = annotateCrossStrainSvSpecificity([
+      {
+        strainId: 'mut',
+        strainLabel: 'Mutant',
+        requestedPloidy: 'auto',
+        effectivePloidy: 2,
+        detectedPloidy: 2,
+        ploidyConfidence: 'high',
+        ploidyReason: 'test',
+        genomeMedianDepth: 30,
+        genomeMedianHetPerKb: 1.5,
+        mitoToNuclearRatio: 20,
+        totalHetSitesSampled: 100,
+        bafHistogram: new Array(20).fill(0),
+        chromSummaries: [],
+        bins: [],
+        cnvSegments: [],
+        lohSegments: [],
+        svEvents: svs,
+      },
+      {
+        strainId: 'wt',
+        strainLabel: 'WT',
+        requestedPloidy: 'auto',
+        effectivePloidy: 2,
+        detectedPloidy: 2,
+        ploidyConfidence: 'high',
+        ploidyReason: 'test',
+        genomeMedianDepth: 30,
+        genomeMedianHetPerKb: 1.5,
+        mitoToNuclearRatio: 20,
+        totalHetSitesSampled: 100,
+        bafHistogram: new Array(20).fill(0),
+        chromSummaries: [],
+        bins: [],
+        cnvSegments: [],
+        lohSegments: [],
+        svEvents: [],
+      },
+    ]);
+    expect(mockProfiles[0].svEvents[0].specificity).toBe('strain_specific');
+
+    const tsv = exportCnvSvToTsv({
+      scanMode: 'deep_sv',
+      ploidyPreference: 'auto',
+      elapsedMs: 100,
+      contigs: [{ name: 'chrIV', length: 100000 }],
+      strains: mockProfiles,
+    });
+    expect(tsv).toContain('SV_BREAKPOINT');
+    expect(tsv).toContain('TRANSLOCATION');
+
+    const bed = exportCnvSvToBed({
+      scanMode: 'deep_sv',
+      ploidyPreference: 'auto',
+      elapsedMs: 100,
+      contigs: [{ name: 'chrIV', length: 100000 }],
+      strains: mockProfiles,
+    });
+    expect(bed).toContain('chrIV\t');
+    expect(bed).toContain('TRANSLOCATION_to_chrVII');
+  });
+});
+
+describe('bamSource (SerializedCachedBlobFile & GmodBamSource)', () => {
+  function createInstrumentedFile(bytes: Uint8Array, name: string, delayMs = 2) {
+    let sliceCalls = 0;
+    let inFlight = 0;
+    let maxConcurrent = 0;
+    const mockFile = {
+      name,
+      size: bytes.byteLength,
+      type: 'application/octet-stream',
+      lastModified: 0,
+      slice(start = 0, end = bytes.byteLength) {
+        sliceCalls += 1;
+        const clampedStart = Math.max(0, Math.min(bytes.byteLength, start));
+        const clampedEnd = Math.max(clampedStart, Math.min(bytes.byteLength, end));
+        const chunk = bytes.subarray(clampedStart, clampedEnd);
+        return {
+          async arrayBuffer() {
+            inFlight += 1;
+            if (inFlight > maxConcurrent) maxConcurrent = inFlight;
+            await new Promise((r) => setTimeout(r, delayMs));
+            inFlight -= 1;
+            return chunk.slice().buffer;
+          },
+        };
+      },
+    } as unknown as File;
+
+    return {
+      file: mockFile,
+      getStats: () => ({ sliceCalls, maxConcurrent }),
+    };
+  }
+
+  it('serializes concurrent BAM slices, applies 512KB read-ahead cache, and handles multi-page spans/EOF', async () => {
+    const size = 1_400_000;
+    const raw = new Uint8Array(size);
+    for (let i = 0; i < size; i += 1) {
+      raw[i] = (i * 31 + 7) & 0xff;
+    }
+    const { file, getStats } = createInstrumentedFile(raw, 'test.bam', 5);
+    const handle = new SerializedCachedBlobFile(file, false);
+
+    // Non-overlapping offsets across 3 different 512KB pages read in parallel
+    const [a, b, c] = await Promise.all([
+      handle.read(256, 100),
+      handle.read(256, 600_000),
+      handle.read(256, 1_100_000),
+    ]);
+    expect(getStats().maxConcurrent).toBe(1);
+    expect(getStats().sliceCalls).toBe(3);
+    expect(Array.from(a)).toEqual(Array.from(raw.subarray(100, 356)));
+    expect(Array.from(b)).toEqual(Array.from(raw.subarray(600_000, 600_256)));
+    expect(Array.from(c)).toEqual(Array.from(raw.subarray(1_100_000, 1_100_256)));
+
+    // Subsequent nearby reads within cached 512KB pages must hit RAM cache with 0 new slice calls
+    const cached = await handle.read(512, 200_000);
+    expect(getStats().sliceCalls).toBe(3);
+    expect(Array.from(cached)).toEqual(Array.from(raw.subarray(200_000, 200_512)));
+
+    // Cross-page boundary read around 512KB (524,288)
+    const boundary = await handle.read(64, 524_288 - 32);
+    expect(Array.from(boundary)).toEqual(Array.from(raw.subarray(524_288 - 32, 524_288 + 32)));
+
+    // EOF clamping
+    const eof = await handle.read(500, size - 120);
+    expect(eof.byteLength).toBe(120);
+    expect(Array.from(eof)).toEqual(Array.from(raw.subarray(size - 120)));
+  });
+
+  it('caches whole small index files (.bai/.csi) in memory on first access', async () => {
+    const baiLike = new Uint8Array(64_000).fill(0x2a);
+    baiLike[0] = 0x42; // B
+    baiLike[1] = 0x41; // A
+    baiLike[2] = 0x49; // I
+    baiLike[3] = 0x01;
+    const { file, getStats } = createInstrumentedFile(baiLike, 'test.bam.bai', 2);
+    const indexHandle = new SerializedCachedBlobFile(file, true);
+
+    const h1 = await indexHandle.read(4, 0);
+    const h2 = await indexHandle.read(128, 32_000);
+    const h3 = await indexHandle.read(64, 60_000);
+    expect(getStats().sliceCalls).toBe(1);
+    expect(Array.from(h1)).toEqual([0x42, 0x41, 0x49, 0x01]);
+    expect(h2.byteLength).toBe(128);
+    expect(h3.byteLength).toBe(64);
+  });
+
+  it('reports clear Korean errors for invalid BAM or BAI files', async () => {
+    const badBam = new File([new Uint8Array([0x50, 0x4b, 0x03, 0x04, 0x00, 0x00])], 'broken.bam');
+    const badBai = new File([new Uint8Array([0x00, 0x01, 0x02, 0x03, 0x00, 0x00])], 'broken.bam.bai');
+    const src = new GmodBamSource('s1', 'Broken', badBam, badBai);
+
+    await expect(src.getContigs()).rejects.toThrow(/올바른 (BAI|BAM|CSI)/);
+  });
+
+  it('serializes disk I/O globally across separate BAM and BAI handles and splits >512KB reads with progress', async () => {
+    let globalInFlight = 0;
+    let globalMaxConcurrent = 0;
+    const makeTrackedFile = (len: number, fillByte: number, name: string) =>
+      ({
+        name,
+        size: len,
+        slice(s = 0, e = len) {
+          const chunkLen = Math.max(0, Math.min(len, e) - Math.max(0, s));
+          return {
+            async arrayBuffer() {
+              globalInFlight += 1;
+              if (globalInFlight > globalMaxConcurrent) globalMaxConcurrent = globalInFlight;
+              await new Promise((r) => setTimeout(r, 4));
+              globalInFlight -= 1;
+              return new Uint8Array(chunkLen).fill(fillByte).buffer;
+            },
+          };
+        },
+      }) as unknown as File;
+
+    const bamFile = makeTrackedFile(1_300_000, 0xaa, 's1.bam');
+    const baiFile = makeTrackedFile(1_200_000, 0xbb, 's1.bam.bai');
+    const progEvents: Array<[number, number]> = [];
+    const bamH = new SerializedCachedBlobFile(bamFile, false);
+    const baiH = new SerializedCachedBlobFile(baiFile, true, {
+      onWholeLoadProgress: (loaded, total) => progEvents.push([loaded, total]),
+    });
+
+    const [b1, b2] = await Promise.all([bamH.read(1024, 0), baiH.read(128, 100)]);
+    expect(globalMaxConcurrent).toBe(1);
+    expect(b1[0]).toBe(0xaa);
+    expect(b2[0]).toBe(0xbb);
+    expect(progEvents.length).toBeGreaterThanOrEqual(3); // 0, 512K, 1024K, 1200K
+    expect(progEvents.at(-1)?.[0]).toBe(1_200_000);
+  });
+
+  it('falls back to mainThreadRelay when slice.arrayBuffer fails and supports AbortSignal cancellation', async () => {
+    const failingFile = {
+      name: 'stalled.bam',
+      size: 2048,
+      slice() {
+        return {
+          async arrayBuffer() {
+            throw new Error('simulated worker IPC stall');
+          },
+        };
+      },
+    } as unknown as File;
+
+    let relayCalls = 0;
+    const rescued = await readBlobSliceSafe(failingFile, 100, 300, {
+      timeoutMs: 200,
+      mainThreadRelay: async (s, e) => {
+        relayCalls += 1;
+        return new Uint8Array(e - s).fill(0x5a);
+      },
+    });
+    expect(relayCalls).toBe(1);
+    expect(rescued.byteLength).toBe(200);
+    expect(rescued[0]).toBe(0x5a);
+
+    const ac = new AbortController();
+    ac.abort();
+    await expect(
+      readBlobRangeInChunks(failingFile, 0, 1024, { signal: ac.signal }),
+    ).rejects.toThrow();
   });
 });

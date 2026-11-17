@@ -86,6 +86,41 @@ const TABLE_3: Record<string, string> = {
 
 export type TranslationTableId = 1 | 3;
 
+const IUPAC_EXPAND_MAP: Record<string, string[]> = {
+  A: ['A'],
+  C: ['C'],
+  G: ['G'],
+  T: ['T'],
+  U: ['T'],
+  R: ['A', 'G'],
+  Y: ['C', 'T'],
+  S: ['G', 'C'],
+  W: ['A', 'T'],
+  K: ['G', 'T'],
+  M: ['A', 'C'],
+  B: ['C', 'G', 'T'],
+  D: ['A', 'G', 'T'],
+  H: ['A', 'C', 'T'],
+  V: ['A', 'C', 'G'],
+};
+
+/**
+ * IUPAC 단일 염기 코드를 실제 A/C/G/T 대립유전자 배열로 전개합니다.
+ */
+export function expandIupacBase(base: string): string[] {
+  const upper = base.toUpperCase();
+  return IUPAC_EXPAND_MAP[upper] ?? ['N'];
+}
+
+/**
+ * 단일 코돈(3 bp DNA)을 S. cerevisiae 핵(Table 1) 또는 미토콘드리아(Table 3) 유전부호로 번역합니다.
+ */
+export function translateCodon(codon: string, tableId: TranslationTableId = 1): string {
+  const clean = codon.toUpperCase().replace(/U/g, 'T');
+  const table = tableId === 3 ? TABLE_3 : TABLE_1;
+  return table[clean] ?? 'X';
+}
+
 export function translateDnaWithCodons(
   dnaSeq: string,
   tableId: TranslationTableId = 1,

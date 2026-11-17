@@ -156,6 +156,8 @@ const SequenceBlockAlignment: React.FC<{
   page: number;
   onPageChange: (p: number) => void;
   focusedCol0: number | null;
+  fontSizePx: 13 | 15 | 17;
+  onFontSizeChange: (px: 13 | 15 | 17) => void;
   formatMatchSymbol?: (colIdx0: number, refCh: string, strainChars: string[]) => string;
   formatBlockCoord?: (startCol0: number, endCol0: number) => string;
   emptyMessage: string;
@@ -170,12 +172,15 @@ const SequenceBlockAlignment: React.FC<{
   page,
   onPageChange,
   focusedCol0,
+  fontSizePx,
+  onFontSizeChange,
   formatMatchSymbol,
   formatBlockCoord,
   emptyMessage,
 }) => {
   const scrollContainerRef = useRef<HTMLDivElement | null>(null);
   const blockRefs = useRef<Map<number, HTMLDivElement>>(new Map());
+  const chunkSize = 10;
 
   const totalLen = useMemo(() => {
     let maxL = refSeq.length;
@@ -227,30 +232,79 @@ const SequenceBlockAlignment: React.FC<{
 
   if (totalLen === 0) {
     return (
-      <div className="rounded-lg border border-slate-200 bg-white p-3 text-center text-xs text-slate-500">
+      <div className="rounded-xl border border-slate-200 bg-white p-4 text-center text-sm text-slate-600">
         {emptyMessage}
       </div>
     );
   }
 
+  const lineHeightPx = fontSizePx === 17 ? 28 : fontSizePx === 15 ? 25 : 21;
+
+  const renderChunkedLine = (
+    seqSlice: string,
+    blockStart: number,
+    classify: AlignmentRowSpec['classifyChar'],
+  ) => {
+    const chunks: React.ReactNode[] = [];
+    for (let g = 0; g < seqSlice.length; g += chunkSize) {
+      const seg = seqSlice.slice(g, g + chunkSize);
+      const runs = coalesceRuns(
+        seg,
+        refSeq.slice(blockStart + g, blockStart + g + seg.length),
+        blockStart + g,
+        classify,
+      );
+      chunks.push(
+        <span key={g} className="mr-4 inline-block shrink-0 last:mr-0">
+          {runs.map((run, rIdx) => (
+            <span key={rIdx} className={run.className} title={run.title}>
+              {run.text}
+            </span>
+          ))}
+        </span>,
+      );
+    }
+    return chunks;
+  };
+
   return (
-    <div className="space-y-2">
+    <div className="space-y-2.5">
       {/* Toolbar & Pagination */}
-      <div className="flex flex-wrap items-center justify-between gap-2 text-[11px]">
-        <div className="flex items-center gap-2">
+      <div className="flex flex-wrap items-center justify-between gap-2 text-xs">
+        <div className="flex flex-wrap items-center gap-2">
           <button
             type="button"
             onClick={onToggleDiffOnly}
-            className={`rounded-lg border px-2.5 py-1 font-semibold transition ${
+            className={`rounded-lg border px-3 py-1.5 font-semibold transition ${
               diffOnly
                 ? 'border-sky-500 bg-sky-600 text-white'
-                : 'border-slate-300 bg-white text-slate-700 hover:bg-slate-100'
+                : 'border-slate-300 bg-white text-slate-800 hover:bg-slate-100'
             }`}
           >
             {diffOnly
               ? `차이 포함 블록만 보는 중 (${visibleBlocks.length}/${allBlocks.length} 블록)`
               : `전체 서열 (${totalLen.toLocaleString()}개) · 차이 블록 필터`}
           </button>
+
+          <div className="flex items-center overflow-hidden rounded-lg border border-slate-300 bg-white">
+            <span className="border-r border-slate-200 bg-slate-50 px-2.5 py-1.5 font-semibold text-slate-600">
+              글자 크기
+            </span>
+            {([13, 15, 17] as const).map((sz) => (
+              <button
+                key={sz}
+                type="button"
+                onClick={() => onFontSizeChange(sz)}
+                className={`border-l border-slate-200 px-2.5 py-1.5 font-semibold transition first:border-l-0 ${
+                  fontSizePx === sz
+                    ? 'bg-sky-600 text-white'
+                    : 'text-slate-700 hover:bg-slate-100'
+                }`}
+              >
+                {sz === 13 ? '보통' : sz === 15 ? '크게' : '특대'}
+              </button>
+            ))}
+          </div>
         </div>
 
         {totalPages > 1 && (
@@ -259,14 +313,14 @@ const SequenceBlockAlignment: React.FC<{
               type="button"
               disabled={safePage === 0}
               onClick={() => onPageChange(safePage - 1)}
-              className="inline-flex items-center rounded border border-slate-300 bg-white px-1.5 py-0.5 text-slate-700 hover:bg-slate-100 disabled:opacity-40"
+              className="inline-flex items-center rounded-lg border border-slate-300 bg-white px-2 py-1 text-slate-700 hover:bg-slate-100 disabled:opacity-40"
             >
-              <ChevronLeft className="h-3.5 w-3.5" />
+              <ChevronLeft className="h-4 w-4" />
             </button>
             <select
               value={safePage}
               onChange={(e) => onPageChange(Number(e.target.value))}
-              className="rounded border border-slate-300 bg-white px-2 py-0.5 font-mono text-[11px] text-slate-800"
+              className="rounded-lg border border-slate-300 bg-white px-2.5 py-1 font-mono text-xs font-medium text-slate-900"
             >
               {Array.from({ length: totalPages }, (_, pIdx) => {
                 const first = visibleBlocks[pIdx * blocksPerPage];
@@ -284,9 +338,9 @@ const SequenceBlockAlignment: React.FC<{
               type="button"
               disabled={safePage >= totalPages - 1}
               onClick={() => onPageChange(safePage + 1)}
-              className="inline-flex items-center rounded border border-slate-300 bg-white px-1.5 py-0.5 text-slate-700 hover:bg-slate-100 disabled:opacity-40"
+              className="inline-flex items-center rounded-lg border border-slate-300 bg-white px-2 py-1 text-slate-700 hover:bg-slate-100 disabled:opacity-40"
             >
-              <ChevronRight className="h-3.5 w-3.5" />
+              <ChevronRight className="h-4 w-4" />
             </button>
           </div>
         )}
@@ -295,10 +349,15 @@ const SequenceBlockAlignment: React.FC<{
       {/* Block List */}
       <div
         ref={scrollContainerRef}
-        className="max-h-72 space-y-2.5 overflow-x-auto overflow-y-auto rounded-lg border border-slate-200 bg-white p-3 font-mono text-[11px] leading-[18px]"
+        style={{
+          fontSize: `${fontSizePx}px`,
+          lineHeight: `${lineHeightPx}px`,
+          letterSpacing: '0.04em',
+        }}
+        className="max-h-[420px] space-y-3 overflow-x-auto overflow-y-auto rounded-xl border border-slate-300 bg-slate-50/60 p-3.5 font-mono"
       >
         {pageBlocks.length === 0 ? (
-          <div className="py-4 text-center text-xs text-slate-500">
+          <div className="py-6 text-center font-sans text-sm text-slate-600">
             일치하지 않는(차이/변이) 블록이 없습니다. 전체 서열 보기 모드로 전환해 전체를 확인할 수 있습니다.
           </div>
         ) : (
@@ -327,75 +386,129 @@ const SequenceBlockAlignment: React.FC<{
                   if (el) blockRefs.current.set(blk.start, el);
                   else blockRefs.current.delete(blk.start);
                 }}
-                className={`rounded px-1.5 py-1 ${
+                className={`rounded-lg border px-3 py-2.5 ${
                   isFocusedBlock
-                    ? 'bg-amber-50/70 ring-1 ring-amber-400'
+                    ? 'border-amber-400 bg-amber-50/90 shadow-xs'
                     : blk.hasDiff
-                      ? 'bg-slate-50/70'
-                      : ''
+                      ? 'border-slate-300 bg-white'
+                      : 'border-slate-200 bg-white'
                 }`}
               >
-                <div className="mb-0.5 flex items-center justify-between text-[10px] text-slate-400">
-                  <span>
+                <div className="mb-1.5 flex flex-wrap items-center justify-between gap-2 border-b border-slate-100 pb-1 font-sans text-xs">
+                  <span className="font-semibold text-slate-700">
                     Pos {(blk.start + 1).toLocaleString()}–{blk.end.toLocaleString()}
                     {formatBlockCoord ? ` · ${formatBlockCoord(blk.start, blk.end)}` : ''}
                   </span>
                   {blk.hasDiff && (
-                    <span className="rounded bg-amber-100 px-1.5 font-sans font-semibold text-amber-800">
+                    <span className="rounded-md bg-amber-100 px-2 py-0.5 text-xs font-bold text-amber-900">
                       변이/차이 구간
                     </span>
                   )}
                 </div>
 
+                {/* 10-bp/10-aa Ruler */}
+                <div className="flex items-baseline whitespace-nowrap text-slate-400 select-none">
+                  <span className="mr-3 w-36 shrink-0 border-r border-slate-200 pr-3 font-sans text-[11px] font-medium tracking-normal text-slate-400">
+                    위치 눈금
+                  </span>
+                  <div className="flex items-baseline">
+                    {(() => {
+                      const rulerItems: React.ReactNode[] = [];
+                      for (let g = 0; g < refSlice.length; g += chunkSize) {
+                        const segLen = Math.min(chunkSize, refSlice.length - g);
+                        const tickLabel = String(blk.start + g + 1);
+                        rulerItems.push(
+                          <span
+                            key={g}
+                            className="relative mr-4 inline-block shrink-0 font-mono last:mr-0"
+                          >
+                            <span aria-hidden="true" className="invisible">
+                              {'A'.repeat(segLen)}
+                            </span>
+                            <span className="absolute left-0 top-1/2 -translate-y-1/2 font-mono text-[11px] font-semibold tracking-normal text-slate-500">
+                              {tickLabel}
+                            </span>
+                          </span>,
+                        );
+                      }
+                      return rulerItems;
+                    })()}
+                  </div>
+                </div>
+
                 {/* Reference Row */}
-                <div className="whitespace-nowrap">
-                  <span className="mr-2 inline-block w-28 truncate align-bottom font-semibold text-slate-600">
+                <div className="flex items-baseline whitespace-nowrap">
+                  <span
+                    className="mr-3 w-36 shrink-0 truncate border-r border-slate-200 pr-3 font-sans text-[13px] font-bold tracking-normal text-emerald-800"
+                    title={refLabel}
+                  >
                     {refLabel}
                   </span>
-                  {focusedCol0 !== null && isFocusedBlock ? (
-                    <>
-                      <span className="text-slate-800">
-                        {refSlice.slice(0, focusedCol0 - blk.start)}
-                      </span>
-                      <span className="bg-amber-300 font-bold text-slate-950">
-                        {refSlice[focusedCol0 - blk.start]}
-                      </span>
-                      <span className="text-slate-800">
-                        {refSlice.slice(focusedCol0 - blk.start + 1)}
-                      </span>
-                    </>
-                  ) : (
-                    <span className="text-slate-800">{refSlice}</span>
-                  )}
+                  <div className="flex items-baseline">
+                    {renderChunkedLine(refSlice, blk.start, (_ch, _rc, colIdx0) => {
+                      if (focusedCol0 === colIdx0) {
+                        return { className: 'rounded-xs bg-amber-300 font-bold text-slate-950' };
+                      }
+                      const hasDiff = strainRows.some((r) => {
+                        const sc = r.seq[colIdx0];
+                        return sc !== undefined && sc !== _ch;
+                      });
+                      return hasDiff
+                        ? { className: 'rounded-xs bg-slate-200/80 font-bold text-slate-950' }
+                        : { className: 'text-slate-900 font-medium' };
+                    })}
+                  </div>
                 </div>
 
                 {/* Match Indicator Row */}
                 {matchChars !== null && (
-                  <div className="whitespace-nowrap text-slate-400 select-none">
-                    <span className="mr-2 inline-block w-28 truncate align-bottom text-[10px]">
-                      일치
+                  <div className="flex items-baseline whitespace-nowrap select-none">
+                    <span className="mr-3 w-36 shrink-0 truncate border-r border-slate-200 pr-3 font-sans text-xs font-semibold tracking-normal text-slate-500">
+                      일치 여부
                     </span>
-                    <span>{matchChars}</span>
+                    <div className="flex items-baseline">
+                      {renderChunkedLine(matchChars, blk.start, (sym) => {
+                        if (sym === '*') {
+                          return {
+                            className: 'rounded-xs bg-rose-600 font-bold text-white',
+                            title: 'Reference 대비 변이/차이 위치',
+                          };
+                        }
+                        if (sym === '.') {
+                          return {
+                            className: 'rounded-xs bg-teal-200 font-bold text-teal-950',
+                            title: '동의(Synonymous) 코돈 변이',
+                          };
+                        }
+                        return { className: 'text-slate-300' };
+                      })}
+                    </div>
                   </div>
                 )}
 
                 {/* Strain Rows */}
                 {strainRows.map((row) => {
                   const sSlice = row.seq.slice(blk.start, blk.end);
-                  const runs = coalesceRuns(sSlice, refSlice, blk.start, row.classifyChar);
                   return (
-                    <div key={row.key} className="whitespace-nowrap">
+                    <div key={row.key} className="flex items-baseline whitespace-nowrap">
                       <span
-                        className={`mr-2 inline-block w-28 truncate align-bottom font-semibold ${row.labelClass}`}
+                        className={`mr-3 w-36 shrink-0 truncate border-r border-slate-200 pr-3 font-sans text-[13px] font-bold tracking-normal ${row.labelClass}`}
                         title={row.label}
                       >
                         {row.label}
                       </span>
-                      {runs.map((run, rIdx) => (
-                        <span key={rIdx} className={run.className} title={run.title}>
-                          {run.text}
-                        </span>
-                      ))}
+                      <div className="flex items-baseline">
+                        {renderChunkedLine(sSlice, blk.start, (ch, rc, colIdx0) => {
+                          const baseRes = row.classifyChar(ch, rc, colIdx0);
+                          if (focusedCol0 === colIdx0 && ch === rc) {
+                            return { ...baseRes, className: 'rounded-xs bg-amber-100 text-slate-950 font-semibold' };
+                          }
+                          if (ch === rc && baseRes.className === 'text-slate-600') {
+                            return { ...baseRes, className: 'text-slate-800' };
+                          }
+                          return baseRes;
+                        })}
+                      </div>
                     </div>
                   );
                 })}
@@ -439,6 +552,7 @@ export const SequenceExtractorModal: React.FC<SequenceExtractorModalProps> = ({
   const [aaPage, setAaPage] = useState(0);
   const [aaDiffOnly, setAaDiffOnly] = useState(false);
   const [focusedAaPos, setFocusedAaPos] = useState<number | null>(null);
+  const [seqFontSize, setSeqFontSize] = useState<13 | 15 | 17>(15);
 
   const rawAnalysis = result?.analysis ?? null;
 
@@ -756,20 +870,20 @@ export const SequenceExtractorModal: React.FC<SequenceExtractorModalProps> = ({
         if (e.target === e.currentTarget) onClose();
       }}
     >
-      <div className="flex max-h-[93vh] w-full max-w-6xl flex-col overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-2xl">
+      <div className="flex max-h-[95vh] w-full max-w-[96vw] xl:max-w-[1440px] flex-col overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-2xl">
         {/* Header */}
-        <div className="flex items-center justify-between gap-3 border-b border-slate-200 bg-slate-50 px-6 py-3.5">
+        <div className="flex items-center justify-between gap-3 border-b border-slate-200 bg-slate-50 px-6 py-4">
           <div className="flex items-center gap-3">
-            <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-sky-100 text-sky-700">
+            <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-sky-100 text-sky-700">
               <Scissors className="h-5 w-5" />
             </div>
             <div>
               <div className="flex flex-wrap items-center gap-2">
-                <h2 className="text-base font-bold text-slate-900">
+                <h2 className="text-lg font-bold text-slate-900">
                   선택 구간 균주별 합의 서열(Consensus) 및 단백질 전체 비교
                 </h2>
                 {selectedFeature && (
-                  <span className="inline-flex items-center gap-1 rounded-md border border-indigo-200 bg-indigo-50 px-2 py-0.5 text-xs font-bold text-indigo-800">
+                  <span className="inline-flex items-center gap-1 rounded-md border border-indigo-200 bg-indigo-50 px-2.5 py-0.5 text-xs sm:text-[13px] font-bold text-indigo-800">
                     {selectedFeature.name}
                     {selectedFeature.systematicName &&
                     selectedFeature.systematicName !== selectedFeature.name
@@ -781,7 +895,7 @@ export const SequenceExtractorModal: React.FC<SequenceExtractorModalProps> = ({
                 )}
               </div>
               {rawAnalysis && (
-                <p className="font-mono text-xs text-slate-600">
+                <p className="mt-0.5 font-mono text-[13px] font-medium text-slate-700">
                   {rawAnalysis.chrom}:{(rawAnalysis.start + 1).toLocaleString()}–
                   {rawAnalysis.end.toLocaleString()} (게놈{' '}
                   {(rawAnalysis.end - rawAnalysis.start).toLocaleString()} bp
@@ -800,7 +914,7 @@ export const SequenceExtractorModal: React.FC<SequenceExtractorModalProps> = ({
             <button
               type="button"
               onClick={onClearAndClose}
-              className="rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-xs font-medium text-slate-700 hover:bg-slate-100"
+              className="rounded-lg border border-slate-300 bg-white px-3.5 py-2 text-[13px] font-semibold text-slate-700 hover:bg-slate-100"
             >
               선택 취소 후 닫기
             </button>
@@ -831,37 +945,37 @@ export const SequenceExtractorModal: React.FC<SequenceExtractorModalProps> = ({
           {rawAnalysis && activeAnalysis && extractedModel && (
             <>
               {/* Control Bar */}
-              <div className="flex flex-wrap items-center justify-between gap-2.5 rounded-xl border border-slate-200 bg-slate-50 p-3">
-                <div className="flex flex-wrap items-center gap-2 text-xs">
-                  <span className="font-medium text-slate-700">좌표(1-based):</span>
+              <div className="flex flex-wrap items-center justify-between gap-2.5 rounded-xl border border-slate-200 bg-slate-50 p-3.5 text-[13px]">
+                <div className="flex flex-wrap items-center gap-2">
+                  <span className="font-semibold text-slate-800">좌표(1-based):</span>
                   <input
                     type="number"
                     min={1}
                     max={chromLength}
                     value={currentStart1}
                     onChange={(e) => setEditStart1(Number(e.target.value))}
-                    className="w-24 rounded-lg border border-slate-300 bg-white px-2 py-1 font-mono text-slate-900 focus:border-sky-500 focus:outline-none"
+                    className="w-28 rounded-lg border border-slate-300 bg-white px-2.5 py-1.5 font-mono text-[13px] font-semibold text-slate-900 focus:border-sky-500 focus:outline-none"
                   />
-                  <span className="text-slate-400">–</span>
+                  <span className="text-slate-500">–</span>
                   <input
                     type="number"
                     min={1}
                     max={chromLength}
                     value={currentEnd1}
                     onChange={(e) => setEditEnd1(Number(e.target.value))}
-                    className="w-24 rounded-lg border border-slate-300 bg-white px-2 py-1 font-mono text-slate-900 focus:border-sky-500 focus:outline-none"
+                    className="w-28 rounded-lg border border-slate-300 bg-white px-2.5 py-1.5 font-mono text-[13px] font-semibold text-slate-900 focus:border-sky-500 focus:outline-none"
                   />
                   <button
                     type="button"
                     onClick={() => applyRange(currentStart1 - 1, currentEnd1)}
-                    className="rounded-lg bg-sky-100 px-2.5 py-1 font-semibold text-sky-800 hover:bg-sky-200"
+                    className="rounded-lg bg-sky-100 px-3 py-1.5 font-semibold text-sky-900 hover:bg-sky-200"
                   >
                     적용
                   </button>
                   <button
                     type="button"
                     onClick={() => applyRange(rawAnalysis.start - 50, rawAnalysis.end + 50)}
-                    className="rounded-lg border border-slate-300 bg-white px-2 py-1 font-medium text-slate-700 hover:bg-slate-100"
+                    className="rounded-lg border border-slate-300 bg-white px-2.5 py-1.5 font-semibold text-slate-800 hover:bg-slate-100"
                     title="프라이머 설계용 앞뒤 50bp 확장"
                   >
                     ±50bp
@@ -869,7 +983,7 @@ export const SequenceExtractorModal: React.FC<SequenceExtractorModalProps> = ({
                   <button
                     type="button"
                     onClick={() => applyRange(rawAnalysis.start - 200, rawAnalysis.end + 200)}
-                    className="rounded-lg border border-slate-300 bg-white px-2 py-1 font-medium text-slate-700 hover:bg-slate-100"
+                    className="rounded-lg border border-slate-300 bg-white px-2.5 py-1.5 font-semibold text-slate-800 hover:bg-slate-100"
                   >
                     ±200bp
                   </button>
@@ -877,19 +991,19 @@ export const SequenceExtractorModal: React.FC<SequenceExtractorModalProps> = ({
                     <button
                       type="button"
                       onClick={() => applyRange(selectedFeature.start, selectedFeature.end)}
-                      className="rounded-lg border border-indigo-300 bg-indigo-50 px-2 py-1 font-semibold text-indigo-800 hover:bg-indigo-100"
+                      className="rounded-lg border border-indigo-300 bg-indigo-50 px-2.5 py-1.5 font-semibold text-indigo-800 hover:bg-indigo-100"
                     >
                       {selectedFeature.name} CDS 경계 복원
                     </button>
                   )}
                 </div>
 
-                <div className="flex flex-wrap items-center gap-2 text-xs">
+                <div className="flex flex-wrap items-center gap-2">
                   <div className="flex overflow-hidden rounded-lg border border-slate-300 bg-white">
                     <button
                       type="button"
                       onClick={() => setSeqFormatMode('ungapped')}
-                      className={`px-2.5 py-1 font-semibold ${
+                      className={`px-3 py-1.5 font-semibold ${
                         seqFormatMode === 'ungapped'
                           ? 'bg-sky-600 text-white'
                           : 'text-slate-700 hover:bg-slate-100'
@@ -900,7 +1014,7 @@ export const SequenceExtractorModal: React.FC<SequenceExtractorModalProps> = ({
                     <button
                       type="button"
                       onClick={() => setSeqFormatMode('aligned')}
-                      className={`border-l border-slate-200 px-2.5 py-1 font-semibold ${
+                      className={`border-l border-slate-200 px-3 py-1.5 font-semibold ${
                         seqFormatMode === 'aligned'
                           ? 'bg-sky-600 text-white'
                           : 'text-slate-700 hover:bg-slate-100'
@@ -914,10 +1028,10 @@ export const SequenceExtractorModal: React.FC<SequenceExtractorModalProps> = ({
                     <button
                       type="button"
                       onClick={() => setUseSplicedCds((v) => !v)}
-                      className={`rounded-lg border px-2.5 py-1 font-semibold ${
+                      className={`rounded-lg border px-3 py-1.5 font-semibold ${
                         useSplicedCds
                           ? 'border-indigo-400 bg-indigo-100 text-indigo-900'
-                          : 'border-slate-300 bg-white text-slate-700 hover:bg-slate-100'
+                          : 'border-slate-300 bg-white text-slate-800 hover:bg-slate-100'
                       }`}
                       title="Intron이 포함된 유전자에서 Exon(CDS)만 연결해 DNA/아미노산 번역 정확도를 유지합니다."
                     >
@@ -930,10 +1044,10 @@ export const SequenceExtractorModal: React.FC<SequenceExtractorModalProps> = ({
                   <button
                     type="button"
                     onClick={() => setIsRevComp((v) => !v)}
-                    className={`inline-flex items-center gap-1 rounded-lg border px-2.5 py-1 font-semibold ${
+                    className={`inline-flex items-center gap-1 rounded-lg border px-3 py-1.5 font-semibold ${
                       isRevComp
                         ? 'border-violet-400 bg-violet-100 text-violet-900'
-                        : 'border-slate-300 bg-white text-slate-700 hover:bg-slate-100'
+                        : 'border-slate-300 bg-white text-slate-800 hover:bg-slate-100'
                     }`}
                   >
                     <ArrowLeftRight className="h-3.5 w-3.5" />
@@ -948,10 +1062,10 @@ export const SequenceExtractorModal: React.FC<SequenceExtractorModalProps> = ({
                         ploidyMode: options.ploidyMode === 'haploid' ? 'diploid' : 'haploid',
                       })
                     }
-                    className={`rounded-lg border px-2.5 py-1 font-semibold ${
+                    className={`rounded-lg border px-3 py-1.5 font-semibold ${
                       options.ploidyMode === 'diploid'
                         ? 'border-amber-400 bg-amber-100 text-amber-900'
-                        : 'border-slate-300 bg-white text-slate-700 hover:bg-slate-100'
+                        : 'border-slate-300 bg-white text-slate-800 hover:bg-slate-100'
                     }`}
                   >
                     {options.ploidyMode === 'haploid' ? 'Haploid' : 'Diploid (IUPAC)'}
@@ -967,14 +1081,14 @@ export const SequenceExtractorModal: React.FC<SequenceExtractorModalProps> = ({
                 const totalBp = activeAnalysis.refSeq.length;
                 if (gaps.length === 0) {
                   return (
-                    <div className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-emerald-200 bg-emerald-50/70 px-3.5 py-2 text-xs text-emerald-900">
-                      <span className="inline-flex items-center gap-1.5 font-semibold">
-                        <CheckCircle2 className="h-4 w-4 text-emerald-600" />
+                    <div className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-emerald-200 bg-emerald-50/70 px-4 py-2.5 text-[13px] text-emerald-950">
+                      <span className="inline-flex items-center gap-2 font-semibold">
+                        <CheckCircle2 className="h-4 w-4 shrink-0 text-emerald-600" />
                         선택 구간 전체 매핑 완료: Reference와 로드된 균주{' '}
                         {extractedModel.strains.length}개 모두 {totalBp.toLocaleString()} bp 전
                         구간이 기준 Depth({options.minDepth}x+) 이상으로 완전히 매핑되었습니다.
                       </span>
-                      <span className="font-mono text-[11px] text-emerald-800">
+                      <span className="font-mono text-xs font-semibold text-emerald-900">
                         {extractedModel.strains
                           .map((s) =>
                             s.mappingStats
@@ -987,12 +1101,12 @@ export const SequenceExtractorModal: React.FC<SequenceExtractorModalProps> = ({
                   );
                 }
                 return (
-                  <div className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-amber-300 bg-amber-50 px-3.5 py-2 text-xs text-amber-900">
-                    <span className="inline-flex items-center gap-1.5 font-semibold">
-                      <AlertTriangle className="h-4 w-4 text-amber-600" />
+                  <div className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-amber-300 bg-amber-50 px-4 py-2.5 text-[13px] text-amber-950">
+                    <span className="inline-flex items-center gap-2 font-semibold">
+                      <AlertTriangle className="h-4 w-4 shrink-0 text-amber-600" />
                       일부 구간 저심도/미매핑(N) 발견 (Depth &lt; {options.minDepth}x):
                     </span>
-                    <span className="font-mono text-[11px]">
+                    <span className="font-mono text-xs font-semibold">
                       {gaps
                         .map((g) => {
                           const st = g.mappingStats!;
@@ -1005,9 +1119,9 @@ export const SequenceExtractorModal: React.FC<SequenceExtractorModalProps> = ({
               })()}
 
               {/* Strain Cards + Full Scrollable Sequences */}
-              <div className="space-y-2">
-                <div className="flex items-center justify-between text-[11px] text-slate-600">
-                  <span className="font-semibold">
+              <div className="space-y-2.5">
+                <div className="flex items-center justify-between text-[13px] text-slate-700">
+                  <span className="font-bold">
                     Reference 및 매핑 균주 서열 ({1 + extractedModel.strains.length}개 트랙)
                   </span>
                   <button
@@ -1034,7 +1148,7 @@ export const SequenceExtractorModal: React.FC<SequenceExtractorModalProps> = ({
                       title: 'Reference',
                       seq: extractedModel.refCardSeq,
                       accent: 'border-emerald-200 bg-emerald-50/50',
-                      badge: 'text-emerald-800',
+                      badge: 'text-emerald-900',
                       statsText:
                         extractedModel.refNBp > 0
                           ? `Reference N ${extractedModel.refNBp} bp`
@@ -1060,27 +1174,27 @@ export const SequenceExtractorModal: React.FC<SequenceExtractorModalProps> = ({
                     return (
                       <div
                         key={item.key}
-                        className={`flex flex-col justify-between rounded-xl border p-3 ${item.accent}`}
+                        className={`flex flex-col justify-between rounded-xl border p-3.5 ${item.accent}`}
                       >
                         <div className="flex items-center justify-between gap-2">
-                          <span className={`truncate text-xs font-bold ${item.badge}`} title={item.title}>
+                          <span className={`truncate text-sm font-bold ${item.badge}`} title={item.title}>
                             {item.title}
                           </span>
-                          <span className="shrink-0 font-mono text-xs font-semibold text-slate-700">
+                          <span className="shrink-0 font-mono text-sm font-bold text-slate-900">
                             {item.seq.replace(/-/g, '').length.toLocaleString()} bp
                           </span>
                         </div>
                         <div
-                          className={`mt-1 text-[10px] font-medium ${
-                            item.isComplete ? 'text-emerald-700' : 'text-amber-700'
+                          className={`mt-1 text-xs font-semibold ${
+                            item.isComplete ? 'text-emerald-800' : 'text-amber-800'
                           }`}
                         >
                           {item.statsText}
                         </div>
                         <div
-                          className={`mt-2 rounded border border-slate-200 bg-white px-2 py-1.5 font-mono text-[11px] text-slate-800 ${
+                          className={`mt-2.5 rounded-lg border border-slate-300 bg-white px-3 py-2 font-mono text-sm font-medium tracking-wide text-slate-900 ${
                             expandedCards
-                              ? 'max-h-32 overflow-y-auto break-all leading-4'
+                              ? 'max-h-48 overflow-y-auto break-all leading-6'
                               : 'truncate'
                           }`}
                         >
@@ -1090,16 +1204,16 @@ export const SequenceExtractorModal: React.FC<SequenceExtractorModalProps> = ({
                             ? '...'
                             : ''}
                         </div>
-                        <div className="mt-2.5 flex gap-2">
+                        <div className="mt-3 flex gap-2">
                           <button
                             type="button"
                             onClick={() => copyText(`${item.key}_raw`, item.seq)}
-                            className="inline-flex flex-1 items-center justify-center gap-1 rounded-lg border border-slate-300 bg-white px-2 py-1 text-[11px] font-semibold text-slate-700 hover:bg-slate-100"
+                            className="inline-flex flex-1 items-center justify-center gap-1.5 rounded-lg border border-slate-300 bg-white px-2.5 py-1.5 text-xs font-semibold text-slate-800 hover:bg-slate-100"
                           >
                             {copiedKey === `${item.key}_raw` ? (
-                              <Check className="h-3 w-3 text-emerald-600" />
+                              <Check className="h-3.5 w-3.5 text-emerald-600" />
                             ) : (
-                              <Copy className="h-3 w-3" />
+                              <Copy className="h-3.5 w-3.5" />
                             )}
                             순수 서열 복사
                           </button>
@@ -1114,12 +1228,12 @@ export const SequenceExtractorModal: React.FC<SequenceExtractorModalProps> = ({
                                 ),
                               )
                             }
-                            className="inline-flex flex-1 items-center justify-center gap-1 rounded-lg border border-slate-300 bg-white px-2 py-1 text-[11px] font-semibold text-slate-700 hover:bg-slate-100"
+                            className="inline-flex flex-1 items-center justify-center gap-1.5 rounded-lg border border-slate-300 bg-white px-2.5 py-1.5 text-xs font-semibold text-slate-800 hover:bg-slate-100"
                           >
                             {copiedKey === `${item.key}_fa` ? (
-                              <Check className="h-3 w-3 text-emerald-600" />
+                              <Check className="h-3.5 w-3.5 text-emerald-600" />
                             ) : (
-                              <Copy className="h-3 w-3" />
+                              <Copy className="h-3.5 w-3.5" />
                             )}
                             FASTA 복사
                           </button>
@@ -1132,21 +1246,21 @@ export const SequenceExtractorModal: React.FC<SequenceExtractorModalProps> = ({
 
               {/* Full Nucleotide Alignment Comparison */}
               <div className="rounded-xl border border-slate-200 bg-slate-50 p-4">
-                <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
+                <div className="mb-2.5 flex flex-wrap items-center justify-between gap-2">
                   <div>
-                    <span className="text-xs font-bold text-slate-800">
+                    <span className="text-sm font-bold text-slate-900">
                       염기 단위 전체 정렬 비교 (
                       {extractedModel.alignedRefOriented.length.toLocaleString()} 컬럼 ·{' '}
                       {isRevComp ? "역상보 5'→3' (-)" : "정방향 5'→3' (+)"})
                     </span>
-                    <span className="ml-2 text-[11px] text-slate-500">
+                    <span className="ml-2 text-xs font-semibold text-slate-600">
                       차이/변이 {extractedModel.dnaDiffMarkers.length}컬럼
                     </span>
                   </div>
-                  <div className="flex flex-wrap items-center gap-2 text-[11px] text-slate-600">
+                  <div className="flex flex-wrap items-center gap-3 text-xs text-slate-700">
                     {extractedModel.strains.map((s) => (
                       <span key={s.key} className={`font-semibold ${s.style.labelClass}`}>
-                        ■ {s.title.slice(0, 12)} 변이
+                        ■ {s.title.slice(0, 16)} 변이
                       </span>
                     ))}
                     <span className="font-semibold text-rose-700">■ 결실(-)</span>
@@ -1155,8 +1269,8 @@ export const SequenceExtractorModal: React.FC<SequenceExtractorModalProps> = ({
                 </div>
 
                 {extractedModel.dnaDiffMarkers.length > 0 && (
-                  <div className="mb-2 flex flex-wrap items-center gap-1">
-                    <span className="mr-1 text-[10px] font-semibold text-slate-500">
+                  <div className="mb-3 flex flex-wrap items-center gap-1.5">
+                    <span className="mr-1 text-xs font-bold text-slate-700">
                       변이 바로가기:
                     </span>
                     {extractedModel.dnaDiffMarkers.slice(0, 24).map((m) => (
@@ -1164,12 +1278,12 @@ export const SequenceExtractorModal: React.FC<SequenceExtractorModalProps> = ({
                         key={m.colIdx0}
                         type="button"
                         onClick={() => jumpToDnaCol(m.colIdx0)}
-                        className={`rounded border px-1.5 py-0.5 font-mono text-[10px] font-semibold transition ${
+                        className={`rounded-md border px-2 py-1 font-mono text-xs font-semibold transition ${
                           focusedDnaCol === m.colIdx0
                             ? 'border-amber-500 bg-amber-200 text-amber-950'
                             : m.isGap
-                              ? 'border-amber-200 bg-amber-50 text-amber-800 hover:bg-amber-100'
-                              : 'border-sky-200 bg-white text-sky-800 hover:bg-sky-100'
+                              ? 'border-amber-300 bg-amber-50 text-amber-900 hover:bg-amber-100'
+                              : 'border-sky-300 bg-white text-sky-900 hover:bg-sky-100'
                         }`}
                         title={`${rawAnalysis.chrom}:${m.refPos1.toLocaleString()} (서열 Pos ${m.colIdx0 + 1})`}
                       >
@@ -1177,7 +1291,7 @@ export const SequenceExtractorModal: React.FC<SequenceExtractorModalProps> = ({
                       </button>
                     ))}
                     {extractedModel.dnaDiffMarkers.length > 24 && (
-                      <span className="text-[10px] text-slate-500">
+                      <span className="text-xs font-medium text-slate-600">
                         외 {extractedModel.dnaDiffMarkers.length - 24}건
                       </span>
                     )}
@@ -1198,6 +1312,8 @@ export const SequenceExtractorModal: React.FC<SequenceExtractorModalProps> = ({
                   page={dnaPage}
                   onPageChange={setDnaPage}
                   focusedCol0={focusedDnaCol}
+                  fontSizePx={seqFontSize}
+                  onFontSizeChange={setSeqFontSize}
                   formatMatchSymbol={(_colIdx0, rc, sChars) =>
                     sChars.some((sc) => sc !== rc) ? '*' : '|'
                   }
@@ -1241,14 +1357,14 @@ export const SequenceExtractorModal: React.FC<SequenceExtractorModalProps> = ({
 
               {/* Full Amino Acid Translation & Protein Comparison Panel */}
               <div className="rounded-xl border border-slate-200 bg-slate-50 p-4">
-                <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+                <div className="mb-3.5 flex flex-wrap items-center justify-between gap-2.5">
                   <div className="flex flex-wrap items-center gap-2">
                     <FlaskConical className="h-4 w-4 text-violet-600" />
-                    <span className="text-xs font-bold text-slate-800">
+                    <span className="text-sm font-bold text-slate-900">
                       아미노산 전체 번역 및 단백질 서열 비교 ({extractedModel.refAA.length.toLocaleString()} aa)
                     </span>
                     {selectedFeature && !isExactFeatureBounds && (
-                      <span className="rounded bg-amber-100 px-2 py-0.5 text-[10px] font-semibold text-amber-900">
+                      <span className="rounded-md bg-amber-100 px-2.5 py-0.5 text-xs font-semibold text-amber-900">
                         주의: 좌표 확장은 시작 프레임(+1)을 이동시킬 수 있습니다
                       </span>
                     )}
@@ -1259,7 +1375,7 @@ export const SequenceExtractorModal: React.FC<SequenceExtractorModalProps> = ({
                       onChange={(e) =>
                         setManualTableId(Number(e.target.value) as TranslationTableId)
                       }
-                      className="rounded-lg border border-slate-300 bg-white px-2 py-1 text-xs text-slate-900"
+                      className="rounded-lg border border-slate-300 bg-white px-2.5 py-1.5 text-xs font-medium text-slate-900"
                     >
                       <option value={1}>Table 1: 표준 핵 유전부호 (chrI–chrXVI)</option>
                       <option value={3}>Table 3: 효모 미토콘드리아 (chrM · TGA=W)</option>
@@ -1267,7 +1383,7 @@ export const SequenceExtractorModal: React.FC<SequenceExtractorModalProps> = ({
                     <select
                       value={frame}
                       onChange={(e) => setFrame(Number(e.target.value) as 0 | 1 | 2)}
-                      className="rounded-lg border border-slate-300 bg-white px-2 py-1 text-xs text-slate-900"
+                      className="rounded-lg border border-slate-300 bg-white px-2.5 py-1.5 text-xs font-medium text-slate-900"
                     >
                       <option value={0}>Frame +1</option>
                       <option value={1}>Frame +2</option>
@@ -1276,12 +1392,12 @@ export const SequenceExtractorModal: React.FC<SequenceExtractorModalProps> = ({
                     <button
                       type="button"
                       onClick={() => copyText('protein_faa', extractedModel.proteinMultiFasta)}
-                      className="inline-flex items-center gap-1 rounded-lg border border-slate-300 bg-white px-2.5 py-1 text-[11px] font-semibold text-slate-700 hover:bg-slate-100"
+                      className="inline-flex items-center gap-1.5 rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-xs font-semibold text-slate-800 hover:bg-slate-100"
                     >
                       {copiedKey === 'protein_faa' ? (
-                        <Check className="h-3 w-3 text-emerald-600" />
+                        <Check className="h-3.5 w-3.5 text-emerald-600" />
                       ) : (
-                        <Copy className="h-3 w-3" />
+                        <Copy className="h-3.5 w-3.5" />
                       )}
                       단백질 FASTA 복사
                     </button>
@@ -1293,19 +1409,19 @@ export const SequenceExtractorModal: React.FC<SequenceExtractorModalProps> = ({
                           extractedModel.proteinMultiFasta,
                         )
                       }
-                      className="inline-flex items-center gap-1 rounded-lg border border-slate-300 bg-white px-2.5 py-1 text-[11px] font-semibold text-slate-700 hover:bg-slate-100"
+                      className="inline-flex items-center gap-1.5 rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-xs font-semibold text-slate-800 hover:bg-slate-100"
                     >
-                      <Download className="h-3 w-3" />
+                      <Download className="h-3.5 w-3.5" />
                       .faa 저장
                     </button>
                   </div>
                 </div>
 
                 {/* Per-Strain Protein Summary & Clickable AA Mutations */}
-                <div className="mb-3 space-y-1.5">
-                  <div className="flex flex-wrap items-center gap-2 rounded-lg border border-slate-200 bg-white px-3 py-1.5 text-xs">
-                    <span className="font-semibold text-slate-700">Reference 단백질:</span>
-                    <span className="font-mono text-slate-800">
+                <div className="mb-3.5 space-y-2">
+                  <div className="flex flex-wrap items-center gap-2 rounded-lg border border-slate-200 bg-white px-3.5 py-2 text-[13px]">
+                    <span className="font-semibold text-slate-800">Reference 단백질:</span>
+                    <span className="font-mono font-medium text-slate-900">
                       {extractedModel.refAA.length.toLocaleString()} aa
                       {extractedModel.refAA.endsWith('*') ? ' (종결 코돈 * 포함)' : ''}
                     </span>
@@ -1317,13 +1433,13 @@ export const SequenceExtractorModal: React.FC<SequenceExtractorModalProps> = ({
                     return (
                       <div
                         key={s.key}
-                        className="space-y-1.5 rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs"
+                        className="space-y-2 rounded-lg border border-slate-200 bg-white px-3.5 py-2.5 text-xs"
                       >
                         <div className="flex flex-wrap items-center justify-between gap-2">
                           <div className="flex flex-wrap items-center gap-2">
-                            <span className={`font-bold ${s.style.badge}`}>{s.title}</span>
+                            <span className={`text-sm font-bold ${s.style.badge}`}>{s.title}</span>
                             <span
-                              className={`rounded px-1.5 py-0.5 text-[10px] font-bold ${
+                              className={`rounded-md px-2 py-0.5 text-xs font-bold ${
                                 pe.status === 'Identical'
                                   ? 'bg-emerald-100 text-emerald-800'
                                   : pe.status === 'Synonymous'
@@ -1335,11 +1451,11 @@ export const SequenceExtractorModal: React.FC<SequenceExtractorModalProps> = ({
                             >
                               {pe.status}
                             </span>
-                            <span className="font-mono text-[11px] text-slate-600">
+                            <span className="font-mono text-[13px] font-medium text-slate-700">
                               {pe.aa.length.toLocaleString()} aa
                               {lenDiff !== 0 ? ` (${lenDiff > 0 ? `+${lenDiff}` : lenDiff} aa)` : ''}
                             </span>
-                            <span className="text-[11px] text-slate-600">
+                            <span className="text-xs text-slate-700">
                               · 아미노산 치환 {pe.realChangeCount}건
                               {pe.synonymousPositions.length > 0
                                 ? ` · 동의 코돈 ${pe.synonymousPositions.length}건`
@@ -1352,8 +1468,8 @@ export const SequenceExtractorModal: React.FC<SequenceExtractorModalProps> = ({
                         </div>
 
                         {pe.details.length > 0 && (
-                          <div className="flex flex-wrap items-center gap-1">
-                            <span className="mr-1 text-[10px] font-semibold text-slate-500">
+                          <div className="flex flex-wrap items-center gap-1.5">
+                            <span className="mr-1 text-xs font-semibold text-slate-600">
                               아미노산 변이 (클릭 시 위치 이동):
                             </span>
                             {pe.details.slice(0, 60).map((d: AaChangeDetail) => (
@@ -1361,7 +1477,7 @@ export const SequenceExtractorModal: React.FC<SequenceExtractorModalProps> = ({
                                 key={`${s.key}_${d.aaPos1}`}
                                 type="button"
                                 onClick={() => jumpToAaPos(d.aaPos1, true)}
-                                className={`rounded border px-1.5 py-0.5 font-mono text-[10px] font-semibold transition ${
+                                className={`rounded-md border px-2 py-1 font-mono text-xs font-semibold transition ${
                                   focusedAaPos === d.aaPos1 - 1
                                     ? 'border-amber-500 bg-amber-200 text-amber-950'
                                     : d.isStopGain
@@ -1376,7 +1492,7 @@ export const SequenceExtractorModal: React.FC<SequenceExtractorModalProps> = ({
                               </button>
                             ))}
                             {pe.details.length > 60 && (
-                              <span className="text-[10px] text-slate-500">
+                              <span className="text-xs text-slate-600">
                                 외 {pe.details.length - 60}건
                               </span>
                             )}
@@ -1401,6 +1517,8 @@ export const SequenceExtractorModal: React.FC<SequenceExtractorModalProps> = ({
                   }}
                   page={aaPage}
                   onPageChange={setAaPage}
+                  fontSizePx={seqFontSize}
+                  onFontSizeChange={setSeqFontSize}
                   focusedCol0={focusedAaPos}
                   formatMatchSymbol={(colIdx0, rc, sChars) => {
                     if (sChars.some((sc) => sc !== rc)) return '*';
@@ -1464,7 +1582,7 @@ export const SequenceExtractorModal: React.FC<SequenceExtractorModalProps> = ({
                             title: `AA ${colIdx0 + 1}: 동의 변이 (${rc}→${sc}, ${ch})`,
                           };
                         }
-                        return { className: 'text-slate-600' };
+                        return { className: 'text-slate-800' };
                       },
                     };
                   })}
@@ -1476,12 +1594,12 @@ export const SequenceExtractorModal: React.FC<SequenceExtractorModalProps> = ({
 
         {/* Footer Export Actions */}
         {rawAnalysis && extractedModel && (
-          <div className="flex flex-wrap items-center justify-between gap-3 border-t border-slate-200 bg-slate-50 px-6 py-3.5">
+          <div className="flex flex-wrap items-center justify-between gap-3 border-t border-slate-200 bg-slate-50 px-6 py-4">
             <div className="flex flex-wrap items-center gap-2">
               <button
                 type="button"
                 onClick={() => copyText('multi_fasta', extractedModel.multiFasta)}
-                className="inline-flex items-center gap-1.5 rounded-xl bg-sky-600 px-4 py-2 text-xs font-semibold text-white hover:bg-sky-700"
+                className="inline-flex items-center gap-1.5 rounded-xl bg-sky-600 px-4 py-2 text-[13px] font-semibold text-white hover:bg-sky-700"
               >
                 {copiedKey === 'multi_fasta' ? (
                   <Check className="h-4 w-4" />
@@ -1503,9 +1621,9 @@ export const SequenceExtractorModal: React.FC<SequenceExtractorModalProps> = ({
                     extractedModel.multiFasta,
                   )
                 }
-                className="inline-flex items-center gap-1.5 rounded-xl border border-slate-300 bg-white px-3.5 py-2 text-xs font-semibold text-slate-700 hover:bg-slate-100"
+                className="inline-flex items-center gap-1.5 rounded-xl border border-slate-300 bg-white px-3.5 py-2 text-[13px] font-semibold text-slate-800 hover:bg-slate-100"
               >
-                <Download className="h-3.5 w-3.5" />
+                <Download className="h-4 w-4" />
                 .fasta 저장
               </button>
 
@@ -1526,9 +1644,9 @@ export const SequenceExtractorModal: React.FC<SequenceExtractorModalProps> = ({
                     'text/tab-separated-values;charset=utf-8',
                   );
                 }}
-                className="inline-flex items-center gap-1.5 rounded-xl border border-slate-300 bg-white px-3.5 py-2 text-xs font-semibold text-slate-700 hover:bg-slate-100"
+                className="inline-flex items-center gap-1.5 rounded-xl border border-slate-300 bg-white px-3.5 py-2 text-[13px] font-semibold text-slate-800 hover:bg-slate-100"
               >
-                <Download className="h-3.5 w-3.5" />
+                <Download className="h-4 w-4" />
                 구간 변이 .tsv 저장
               </button>
             </div>
@@ -1548,7 +1666,7 @@ export const SequenceExtractorModal: React.FC<SequenceExtractorModalProps> = ({
                         : `Ref_${extractedModel.coordTag}`;
                     onSendToLocalBlast(`>${label}\n${targetSeq}`);
                   }}
-                  className="inline-flex items-center gap-1.5 rounded-xl border border-indigo-300 bg-indigo-50 px-3.5 py-2 text-xs font-semibold text-indigo-800 hover:bg-indigo-100"
+                  className="inline-flex items-center gap-1.5 rounded-xl border border-indigo-300 bg-indigo-50 px-3.5 py-2 text-[13px] font-semibold text-indigo-800 hover:bg-indigo-100"
                 >
                   로컬 BLAST로 매핑 확인
                 </button>
@@ -1561,10 +1679,10 @@ export const SequenceExtractorModal: React.FC<SequenceExtractorModalProps> = ({
                   )}`}
                   target="_blank"
                   rel="noreferrer"
-                  className="inline-flex items-center gap-1.5 rounded-xl border border-emerald-300 bg-emerald-50 px-3.5 py-2 text-xs font-semibold text-emerald-800 hover:bg-emerald-100"
+                  className="inline-flex items-center gap-1.5 rounded-xl border border-emerald-300 bg-emerald-50 px-3.5 py-2 text-[13px] font-semibold text-emerald-800 hover:bg-emerald-100"
                   title="GET URL 길이 제한으로 최대 7,000 bp까지만 자동 입력됩니다"
                 >
-                  <ExternalLink className="h-3.5 w-3.5" />
+                  <ExternalLink className="h-4 w-4" />
                   균주1 서열 NCBI BLAST
                 </a>
               )}

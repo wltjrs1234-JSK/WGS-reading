@@ -1,10 +1,37 @@
 @import "tailwindcss";
 
+:root {
+  --wgs-font-sans: 'Pretendard Variable', 'Pretendard', 'Noto Sans KR', 'Malgun Gothic', sans-serif;
+  --wgs-font-mono: 'JetBrains Mono', 'Consolas', monospace;
+  --font-sans: var(--wgs-font-sans);
+  --font-mono: var(--wgs-font-mono);
+}
+
 html,
 body,
 #root {
   height: 100%;
   margin: 0;
   padding: 0;
+  font-family: var(--wgs-font-sans);
+  -webkit-font-smoothing: antialiased;
+  color: #0f172a;
+}
+
+button,
+input,
+select,
+textarea {
+  font-family: inherit;
+}
+
+.font-sans {
+  font-family: var(--wgs-font-sans);
+}
+
+.font-mono,
+code,
+pre {
+  font-family: var(--wgs-font-mono) !important;
 }
 

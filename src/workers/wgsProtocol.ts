@@ -1,4 +1,8 @@
 import type { BarcodeCandidate, BarcodeScanOptions } from '../bio/barcodeScanner';
+import type {
+  CnvPloidyPreference,
+  CnvScanMode,
+} from '../bio/cnvSvAnalyzer';
 import type { RegionMappingStats } from '../bio/consensus';
 import type {
   BlastForeignReadHit,
@@ -118,12 +122,16 @@ export interface ExtractionResult {
   extraStrains: ExtractedExtraStrain[];
 }
 
+export type VariantScanScope = 'current_chrom' | 'all_chroms';
+
 export interface ScanProgressEvent {
   type: 'scan_progress';
   chrom: string;
   scannedBp: number;
   totalBp: number;
   variantsSoFar: number;
+  chromIndex?: number;
+  totalChroms?: number;
 }
 
 export interface LoadProgressEvent {
@@ -213,6 +221,21 @@ export interface BarcodeScanResult {
   filteredStats?: BarcodeScanFilteredStats;
 }
 
+export interface CnvSvPayload {
+  scanMode: CnvScanMode;
+  ploidyPreference: CnvPloidyPreference;
+  targetStrainIndex?: number | null;
+  excludeRdnaSv?: boolean;
+  minSvSupport?: number;
+  contigOverrides?: Record<string, Record<string, string>>;
+}
+
+export interface CnvProgressEvent {
+  type: 'cnv_progress';
+  message: string;
+  percent: number;
+}
+
 export type WorkerRequest =
   | { reqId: number; action: 'load_saccer3'; payload?: { sacCer3Url: string } }
   | { reqId: number; action: 'load_demo' }
@@ -245,6 +268,7 @@ export type WorkerRequest =
       reqId: number;
       action: 'scan_chromosome';
       payload: {
+        scope?: VariantScanScope;
         chrom: string;
         primaryStrainIndex: number;
         secondaryStrainIndex: number | null;
@@ -253,16 +277,30 @@ export type WorkerRequest =
       };
     }
   | { reqId: number; action: 'cancel_scan' }
+  | { reqId: number; action: 'cancel_window' }
+  | { type: 'read_blob_reply'; relayId: number; ok: boolean; buffer?: ArrayBuffer; error?: string }
   | { reqId: number; action: 'search_genes'; payload: { query: string; limit?: number } }
   | { reqId: number; action: 'run_blast'; payload: BlastRunPayload }
   | { reqId: number; action: 'cancel_blast' }
   | { reqId: number; action: 'scan_barcodes'; payload: BarcodeScanPayload }
-  | { reqId: number; action: 'cancel_barcode_scan' };
+  | { reqId: number; action: 'cancel_barcode_scan' }
+  | { reqId: number; action: 'analyze_cnv_sv'; payload: CnvSvPayload }
+  | { reqId: number; action: 'cancel_cnv_sv' };
+
+export interface BlobRelayRequestEvent {
+  type: 'read_blob_slice';
+  relayId: number;
+  fileKey: string;
+  start: number;
+  end: number;
+}
 
 export type WorkerResponse =
   | { reqId: number; ok: true; data: unknown }
-  | { reqId: number; ok: false; error: string }
+  | { reqId: number; ok: false; error: string; aborted?: boolean }
+  | BlobRelayRequestEvent
   | ScanProgressEvent
   | LoadProgressEvent
   | BlastProgressEvent
-  | BarcodeProgressEvent;
+  | BarcodeProgressEvent
+  | CnvProgressEvent;

@@ -21,8 +21,10 @@ interface FileLoaderModalProps {
   activeGenomeLabel: string;
   isLoading: boolean;
   loadingMsg?: string | null;
+  elapsedSec?: number;
   errorMsg: string | null;
   onClose: () => void;
+  onCancelLoad?: () => void;
   onAddTracksOnly: (strains: StrainFileInput[]) => Promise<boolean>;
   onLoadCustomGenome: (payload: LoadLocalFilesPayload) => Promise<boolean>;
   onSelectSacCer3: () => void;
@@ -35,8 +37,10 @@ export const FileLoaderModal: React.FC<FileLoaderModalProps> = ({
   activeGenomeLabel,
   isLoading,
   loadingMsg,
+  elapsedSec = 0,
   errorMsg,
   onClose,
+  onCancelLoad,
   onAddTracksOnly,
   onLoadCustomGenome,
   onSelectSacCer3,
@@ -87,6 +91,7 @@ export const FileLoaderModal: React.FC<FileLoaderModalProps> = ({
 
   const handleDrop = (e: React.DragEvent) => {
     e.preventDefault();
+    e.stopPropagation();
     setIsDragging(false);
     const files = Array.from(e.dataTransfer.files);
     if (files.length > 0) mergeFiles(files);
@@ -116,6 +121,19 @@ export const FileLoaderModal: React.FC<FileLoaderModalProps> = ({
   return (
     <div
       className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/45 p-4 backdrop-blur-xs"
+      onDragOver={(e) => {
+        if (e.dataTransfer.types.includes('Files')) {
+          e.preventDefault();
+          e.stopPropagation();
+        }
+      }}
+      onDrop={(e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        setIsDragging(false);
+        const files = Array.from(e.dataTransfer.files);
+        if (files.length > 0) mergeFiles(files);
+      }}
       onClick={(e) => {
         if (e.target === e.currentTarget) onClose();
       }}
@@ -210,6 +228,27 @@ export const FileLoaderModal: React.FC<FileLoaderModalProps> = ({
                   )}
                 </div>
               </div>
+            </div>
+          )}
+
+          {isLoading && (
+            <div className="flex items-center justify-between gap-2 rounded-xl border border-amber-300 bg-amber-50 p-3 text-xs font-medium text-amber-900">
+              <div className="flex items-center gap-2 min-w-0">
+                <span className="inline-block h-2.5 w-2.5 shrink-0 animate-pulse rounded-full bg-amber-500" />
+                <span className="truncate">
+                  {loadingMsg || '파일 읽는 중...'}
+                  {elapsedSec >= 2 ? ` (${elapsedSec}초)` : ''}
+                </span>
+              </div>
+              {onCancelLoad && (
+                <button
+                  type="button"
+                  onClick={onCancelLoad}
+                  className="shrink-0 rounded-lg border border-amber-400 bg-white px-2.5 py-1 text-[11px] font-semibold text-amber-900 hover:bg-amber-100"
+                >
+                  중단
+                </button>
+              )}
             </div>
           )}
 
@@ -445,7 +484,7 @@ export const FileLoaderModal: React.FC<FileLoaderModalProps> = ({
               className="inline-flex items-center gap-2 rounded-xl bg-sky-600 px-5 py-2 text-xs font-semibold text-white shadow-sm hover:bg-sky-700 disabled:cursor-not-allowed disabled:bg-slate-300 disabled:text-slate-500"
             >
               {isLoading
-                ? loadingMsg || '불러오는 중...'
+                ? '불러오는 중...'
                 : fastaFile
                   ? '커스텀 지놈 적용'
                   : `트랙 ${strains.length}개 추가하기`}

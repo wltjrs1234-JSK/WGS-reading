@@ -1,3 +1,4 @@
+import { readBlobSliceSafe, SAFE_IO_SLICE_BYTES } from '../utils/safeBlobReader';
 import { resolveMatchingRefName, sortYeastContigs } from './yeastAliases';
 import type { ContigInfo, FastaIndexEntry } from './types';
 
@@ -40,11 +41,14 @@ export function parseFaiText(text: string): FastaIndexEntry[] {
  * - UTF-8 BOM 자동 무시
  * - 빈 줄/불규칙 줄 길이가 섞인 비표준 FASTA도 감지해 contig 바이트 범위 슬라이싱 폴백 지원
  */
-async function buildFastaIndexFromFile(file: File): Promise<{
+async function buildFastaIndexFromFile(
+  file: File,
+  onProgress?: (loadedBytes: number, totalBytes: number) => void,
+): Promise<{
   entries: FastaIndexEntry[];
   contigSpans: Map<string, ContigByteSpan>;
 }> {
-  const CHUNK_SIZE = 4 * 1024 * 1024;
+  const CHUNK_SIZE = SAFE_IO_SLICE_BYTES;
   const entries: FastaIndexEntry[] = [];
   const contigSpans = new Map<string, ContigByteSpan>();
 
@@ -84,8 +88,9 @@ async function buildFastaIndexFromFile(file: File): Promise<{
   };
 
   for (let pos = 0; pos < file.size; pos += CHUNK_SIZE) {
-    const slice = file.slice(pos, Math.min(pos + CHUNK_SIZE, file.size));
-    const buf = new Uint8Array(await slice.arrayBuffer());
+    const endPos = Math.min(pos + CHUNK_SIZE, file.size);
+    const buf = await readBlobSliceSafe(file, pos, endPos);
+    onProgress?.(endPos, file.size);
 
     let startI = 0;
     // UTF-8 BOM 건너뛰기
@@ -213,12 +218,13 @@ async function verifyFaiMatchesFile(
   // 첫 컨티그의 선두 바이트와 개행 폭이 실제 FASTA 파일과 일치하는지 확인 (CRLF 변환 등 불일치 감지)
   const first = entries[0];
   if (first.offset > 0) {
-    const prevByte = new Uint8Array(await file.slice(first.offset - 1, first.offset).arrayBuffer())[0];
-    if (prevByte !== 10 && prevByte !== 13) return false;
+    const prevBytes = await readBlobSliceSafe(file, first.offset - 1, first.offset);
+    if (prevBytes[0] !== 10 && prevBytes[0] !== 13) return false;
   }
 
   const probeBases = Math.min(first.length, first.lineBases);
-  const probeText = await file.slice(first.offset, first.offset + first.lineWidth).text();
+  const probeBytes = await readBlobSliceSafe(file, first.offset, first.offset + first.lineWidth);
+  const probeText = new TextDecoder('utf8').decode(probeBytes);
   if (probeText.length < probeBases) return false;
 
   for (let i = 0; i < probeBases; i++) {
@@ -259,7 +265,11 @@ export class IndexedFastaSource implements ReferenceSequenceSource {
     this.contigs = sortYeastContigs(rawContigs);
   }
 
-  static async fromFiles(fastaFile: File, faiFile?: File): Promise<ReferenceSequenceSource> {
+  static async fromFiles(
+    fastaFile: File,
+    faiFile?: File,
+    onProgress?: (loadedBytes: number, totalBytes: number) => void,
+  ): Promise<ReferenceSequenceSource> {
     if (fastaFile.name.toLowerCase().endsWith('.gz')) {
       return MemoryFastaSource.fromGzipFile(fastaFile);
     }
@@ -269,7 +279,8 @@ export class IndexedFastaSource implements ReferenceSequenceSource {
     let usedExternalFai = false;
 
     if (faiFile) {
-      const faiText = await faiFile.text();
+      const faiBytes = await readBlobSliceSafe(faiFile, 0, faiFile.size);
+      const faiText = new TextDecoder('utf8').decode(faiBytes);
       const parsed = parseFaiText(faiText);
       if (await verifyFaiMatchesFile(fastaFile, parsed)) {
         entries = parsed;
@@ -283,7 +294,7 @@ export class IndexedFastaSource implements ReferenceSequenceSource {
     }
 
     if (!usedExternalFai) {
-      const built = await buildFastaIndexFromFile(fastaFile);
+      const built = await buildFastaIndexFromFile(fastaFile, onProgress);
       entries = built.entries;
       contigSpans = built.contigSpans;
     }
@@ -321,7 +332,8 @@ export class IndexedFastaSource implements ReferenceSequenceSource {
     if (spanMeta && !spanMeta.isUniform) {
       let cached = this.irregularCache.get(chrom);
       if (cached === undefined) {
-        const raw = await this.file.slice(spanMeta.startOffset, spanMeta.endOffset).text();
+        const rawBytes = await readBlobSliceSafe(this.file, spanMeta.startOffset, spanMeta.endOffset);
+        const raw = new TextDecoder('utf8').decode(rawBytes);
         cached = raw.replace(/[\r\n\s]/g, '').toUpperCase();
         this.irregularCache.set(chrom, cached);
       }
@@ -337,7 +349,8 @@ export class IndexedFastaSource implements ReferenceSequenceSource {
     const endCol = endBaseIdx % entry.lineBases;
     const byteEnd = entry.offset + endLine * entry.lineWidth + endCol + 1;
 
-    const rawText = await this.file.slice(byteStart, byteEnd).text();
+    const rawBytes = await readBlobSliceSafe(this.file, byteStart, byteEnd);
+    const rawText = new TextDecoder('utf8').decode(rawBytes);
     return rawText.replace(/[\r\n\s]/g, '').toUpperCase();
   }
 }

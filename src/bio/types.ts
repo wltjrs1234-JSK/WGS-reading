@@ -81,6 +81,41 @@ export type DiffCategory =
   | 'gap_s2'
   | 'gap_both';
 
+export type VariantImpact = 'HIGH' | 'MODERATE' | 'LOW' | 'MODIFIER';
+
+export type VariantConsequence =
+  | 'nonsense'
+  | 'frameshift'
+  | 'start_lost'
+  | 'stop_lost'
+  | 'splice_site'
+  | 'gene_loss'
+  | 'missense'
+  | 'inframe_indel'
+  | 'synonymous'
+  | 'ncrna_or_trna'
+  | 'promoter_500bp'
+  | 'intron'
+  | 'low_depth_gap'
+  | 'intergenic';
+
+export interface VariantAnnotationMeta {
+  geneId?: string;
+  geneName: string;
+  systematicName?: string;
+  strand?: '+' | '-' | '.';
+  featureType: string;
+  consequence: VariantConsequence;
+  impact: VariantImpact;
+  hgvsP?: string; // e.g. p.T511I, p.Q142*, p.K85fs
+  hgvsC?: string; // e.g. c.1532C>T
+  codonChange?: string; // e.g. ACA>ATA
+  exonNumber?: number;
+  totalExons?: number;
+  isHeterozygous?: boolean;
+  vcfAnchorBase?: string; // 1 bp upstream base for VCF DEL/INS representation
+}
+
 export interface VariantRecord {
   chrom: string;
   start: number; // 0-based
@@ -92,6 +127,7 @@ export interface VariantRecord {
   s2Allele: string;
   s1Depth: number;
   s2Depth: number;
+  annotation?: VariantAnnotationMeta;
 }
 
 export interface AlignedColumnMeta {
@@ -148,5 +184,21 @@ export interface GffFeature {
 export interface ContigInfo {
   name: string;
   length: number;
+}
+
+export interface SvRawReadSignal {
+  name: string;
+  chrom: string;
+  start: number; // 0-based
+  end: number;   // 0-based exclusive
+  strand: '+' | '-';
+  mapq: number;
+  isPaired: boolean;
+  mateChrom: string | null;
+  matePos: number; // 0-based
+  mateStrand: '+' | '-';
+  tlen: number;
+  saTag?: string;
+  isSupplementary: boolean;
 }
 
